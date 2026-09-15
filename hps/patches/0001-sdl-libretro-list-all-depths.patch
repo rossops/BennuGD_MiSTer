@@ -1,0 +1,28 @@
+diff --git a/libretro/sdl-libretro/src/video/libretro/SDL_LIBRETROvideo.c b/libretro/sdl-libretro/src/video/libretro/SDL_LIBRETROvideo.c
+index 51b66d3..f883e45 100755
+--- a/libretro/sdl-libretro/src/video/libretro/SDL_LIBRETROvideo.c
++++ b/libretro/sdl-libretro/src/video/libretro/SDL_LIBRETROvideo.c
+@@ -509,14 +509,20 @@ const static SDL_Rect *vid_modes[] = {
+ SDL_Rect **LIBRETRO_ListModes(_THIS, SDL_PixelFormat *format, Uint32 flags)
+ {
+ 
++	/* Any depth is native here: the buffer goes straight to the libretro
++	 * frontend. Listing only 32 bpp made SDL emulate a 16 bpp game with a
++	 * shadow surface and convert it with BlitNtoN on every flip, which was
++	 * the single biggest cost in a Streets of Rage Remake frame. */
+ 	switch(format->BitsPerPixel) {
+-	
+-	case 32:		
++	case 8:
++	case 15:
++	case 16:
++	case 24:
++	case 32:
+ 		return (SDL_Rect **) -1;//&vid_modes;
+ 	default:
+ 		return NULL;
+ 	}
+-	//return (SDL_Rect **) -1;
+ }
+ 
+ SDL_Surface *LIBRETRO_SetVideoMode(_THIS, SDL_Surface *current,

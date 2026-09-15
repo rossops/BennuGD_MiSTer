@@ -1,0 +1,5 @@
+# BennuGD for MiSTer: project file list. Add files here, never in the Quartus IDE.
+set_global_assignment -name QIP_FILE rtl/pll.qip
+set_global_assignment -name SDC_FILE BennuGD.sdc
+set_global_assignment -name SYSTEMVERILOG_FILE rtl/bennugd_ctl.sv
+set_global_assignment -name SYSTEMVERILOG_FILE BennuGD.sv

@@ -1,0 +1,3 @@
+[submodule "hps/BennuGD_libretro"]
+	path = hps/BennuGD_libretro
+	url = https://github.com/diekleinekuh/BennuGD_libretro.git

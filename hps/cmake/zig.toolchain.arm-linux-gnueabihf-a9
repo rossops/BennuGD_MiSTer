@@ -1,0 +1,8 @@
+# DE10-Nano HPS: Cortex-A9 with NEON, hard float. glibc 2.17 floor so the
+# binary runs on any MiSTer Linux release. Same shape as the upstream
+# BennuGD_libretro/cmake/zig.toolchain.arm-linux-gnueabihf (cortex_a7 there).
+set(ZIG_TARGET arm-linux-gnueabihf.2.17)
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR arm)
+include("${CMAKE_CURRENT_LIST_DIR}/../BennuGD_libretro/cmake/zig.toolchain.cmake")
+set(CMAKE_C_FLAGS_INIT "${CMAKE_C_FLAGS_INIT} -mcpu=cortex_a9 -mfpu=neon")
