@@ -85,6 +85,22 @@ Saves go to the game's own `savegame` folder, as on a PC. Wait a moment
 after a save before powering off; the card is flushed when the game
 stops.
 
+## Updating with update_all
+
+The repository carries a `db.json.zip` for the MiSTer downloader. Add
+this to `/media/fat/downloader.ini` and run Update All:
+
+```
+[rossops/bennugd_mister]
+db_url = https://raw.githubusercontent.com/rossops/BennuGD_MiSTer/main/db.json.zip
+```
+
+It places the core, the game entries and the ARM side on the card, the
+same files the release zip holds, and keeps them current. Your
+`bennugd.cfg` is left alone. The downloader cannot edit MiSTer.ini or
+`user-startup.sh`, so after the first update still run Scripts ->
+BennuGD_install once (step 4). The game itself is never part of it.
+
 ## If something is wrong
 
 **Black picture over HDMI, sound playing.** Your MiSTer.ini has
@@ -144,7 +160,9 @@ ARM side, on a Mac or Linux box with zig 0.14.0 and cmake:
 
     hps/build.sh              # -> hps/out/bennugd
 
-It applies the patches in `hps/patches/` to the BennuGD_libretro
+`releases/bennugd` is the committed copy of that binary for the downloader
+database; `tools/make_db.py` rebuilds `db.json.zip` from it and the
+release files. It applies the patches in `hps/patches/` to the BennuGD_libretro
 submodule (an SDL shim fix, a scale fast path, a frame-rate cap, all
 explained in the patch files). FPGA side, with Quartus 17.0 Lite:
 
