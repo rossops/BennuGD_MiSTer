@@ -24,9 +24,11 @@ All captures are from the MiSTer over HDMI, through a capture card.
 ## Installing Streets of Rage Remake 5.2
 
 You need a MiSTer updated during 2026 (the launch mechanism relies on a
-Main_MiSTer from this year), a way to put files on the SD card (the
-network share or a card reader), and your own copy of Streets of Rage
-Remake 5.2. Nothing from the game ships with this core.
+Main_MiSTer from this year), a display on the HDMI port (the picture goes
+through the MiSTer scaler; analog output is not supported yet), a way to
+put files on the SD card (the network share or a card reader), and your
+own copy of Streets of Rage Remake 5.2. Nothing from the game ships with
+this core.
 
 **1. Get the game onto the card.** On a PC, SorR 5.2 is a folder with
 `SorR.exe`, `SorR.dat`, `mod`, `palettes` and `savegame` in it. Create
@@ -82,6 +84,34 @@ the game.
 Saves go to the game's own `savegame` folder, as on a PC. Wait a moment
 after a save before powering off; the card is flushed when the game
 stops.
+
+## If something is wrong
+
+**Black picture over HDMI, sound playing.** Your MiSTer.ini has
+`direct_video=1` (used with HDMI-to-VGA DACs). Direct video bypasses the
+scaler, and this core's picture lives in the scaler's framebuffer; its
+own RGB output is black. The installer writes `direct_video=0` into the
+`[BennuGD]` section of MiSTer.ini so the setting is overridden for this
+core only; if you installed before that was added, add the line yourself
+under `[BennuGD]`. Analog output through a DAC is not possible with this
+core yet.
+
+**Choppy sound, game running slowly.** First check the game's display
+mode: look in `/media/fat/bennugd/bennugd.log` for a line `env: av info`.
+It must say `416x240`. If it says `832x480` the game is upscaling in
+software, which the ARM cannot keep up with; set `BORDERLESS_SYNC` in
+`mod/system.txt` as in step 2 and restart. Also choose graphics mode
+1x / normal in the game's own options. The heaviest scenes still drop
+frames on the stock 800 MHz CPU; that is the known limit right now.
+
+**Nothing starts when picking the game.** Check
+`/media/fat/bennugd/launcherd.log`. The daemon must be running (the
+setup script starts it, and `user-startup.sh` starts it at boot).
+
+**Reporting a problem.** Attach `bennugd.log` and `launcherd.log` from
+`/media/fat/bennugd/`, the `[MiSTer]` and `[BennuGD]` sections of your
+MiSTer.ini, and the date of `/media/fat/MiSTer`. That is enough to tell
+most things apart.
 
 **Adding another BennuGD game** is a folder under `/media/fat/games/BennuGD/`
 plus a copy of `SoRR 5.2.mgl` in `_Other/_BennuGD/` with the name and the
