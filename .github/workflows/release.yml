@@ -10,6 +10,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write   # the Release step creates the release and uploads the assets
+
 jobs:
   hps:
     runs-on: ubuntu-latest
