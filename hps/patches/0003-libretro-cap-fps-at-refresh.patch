@@ -1,0 +1,33 @@
+diff --git a/libretro/libretro.c b/libretro/libretro.c
+index 337073d..5bd1f1c 100644
+--- a/libretro/libretro.c
++++ b/libretro/libretro.c
+@@ -75,6 +75,7 @@ int bennugd_content_width=0;
+ int bennugd_content_height=0;
+ char* libretro_base_dir;
+ bool retro_enable_frame_limiter=true;
++static float libretro_refresh_rate = 0;   /* from RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE */
+ bool force_frame_limiter=false;
+ bool case_insensitive_file_io=true;
+ 
+@@ -790,6 +791,7 @@ void retro_init(void)
+     float frontend_refresh_rate = 0;
+     if (environ_cb(RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE, &frontend_refresh_rate))
+     {
++        libretro_refresh_rate = frontend_refresh_rate;
+         last_av_info.timing.fps = frontend_refresh_rate;
+     }
+ 
+@@ -983,7 +985,11 @@ void retro_run(void)
+                 submit_new_avinfo = true;
+             }
+ 
+-            if (fps_value>last_av_info.timing.fps)
++            /* Never report more than the frontend's refresh rate: a game that
++             * calls set_fps(120) in a "vsync" mode (Streets of Rage Remake's
++             * BORDERLESS_SYNC) relies on the display to pace it at 60, and its
++             * own limiter is off while fps_value equals the reported rate. */
++            if (fps_value>last_av_info.timing.fps && !(libretro_refresh_rate > 0 && fps_value > libretro_refresh_rate))
+             {
+                 last_av_info.timing.fps = fps_value;
+                 submit_new_avinfo = true;

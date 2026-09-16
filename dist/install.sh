@@ -19,6 +19,9 @@ if [ -n "$1" ]; then
     rm -f /media/fat/_Other/BennuGD_*.rbf      # older layout: the core next to the folder
 fi
 [ -d "$HERE/mgl" ] && cp "$HERE"/mgl/*.mgl "$CORES/"
+# a release zip unpacked at the card root already put the rbf in _Other/_BennuGD;
+# a copy left in this folder (older layout) is moved there too
+for r in "$HERE"/BennuGD_*.rbf; do [ -f "$r" ] && mv "$r" "$CORES/"; done
 INI=/media/fat/MiSTer.ini
 sed -i '/^\[BennuGD\]$/,/^main=bennugd\/bennugd$/d' "$INI"    # the abandoned main= handoff
 if ! grep -q '^\[BennuGD\]' "$INI"; then

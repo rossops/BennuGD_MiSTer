@@ -17,6 +17,8 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <sched.h>
 #include <arm_neon.h>
 
 /* The framebuffer mapping is uncached device memory: plain memcpy stores
@@ -50,9 +52,25 @@ static volatile uint32_t *ctl;
 static bool      have_ctl;
 static unsigned  fixed_w, fixed_h;
 static unsigned  cur_w, cur_h;    /* geometry published in the block */
+/* The uncached copy into DDR3 costs 2.5 ms whatever the instruction mix,
+ * about 15 % of a frame. It runs on a helper thread (the second A9 core
+ * is mostly idle) while the game computes the next frame: video_present
+ * only copies the core surface into a cached staging buffer and hands it
+ * over. The helper also does the flip bookkeeping and the vblank wait. */
+static pthread_t       copier;
+static void *copier_main(void *arg);
+static void pin_to_cpu(int cpu);
+static pthread_mutex_t mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  cv  = PTHREAD_COND_INITIALIZER;
+static uint8_t        *staging[2];       /* cached, w*h*2 each */
+static unsigned        staging_w, staging_h;
+static int             latest = -1;      /* staging index holding the newest complete frame, -1 none */
+static int             reading = -1;     /* staging index the copier is copying right now */
+static bool            copier_run;
 static int       pending = -1;    /* buffer published, shown from the next vblank on */
 static uint32_t  published_v;     /* vblank count when it was published */
 static unsigned  dropped;
+static unsigned  replaced;        /* frames replaced by a newer one before the copier took them */
 static double    vblank_hz;
 static const char *dumpdir;
 static int       dump_every;
@@ -92,8 +110,14 @@ int video_init(unsigned long fb_phys, unsigned w, unsigned h, const char *dir, i
     if (ctl) {
         /* does anyone update the vblank counter? then the core has the control block */
         ctl[CTL_PRESENT] = 0; ctl[CTL_WIDTH] = 0; ctl[CTL_HEIGHT] = 0; ctl[CTL_STRIDE] = 0;
-        uint32_t v0 = ctl[CTL_VBLANK];
-        have_ctl = wait_vblank_change(v0, 100000) != v0;
+        /* three tries: right after a core load the FPGA may still be in reset */
+        for (int attempt = 0; attempt < 3 && !have_ctl; attempt++) {
+            uint32_t v0 = ctl[CTL_VBLANK];
+            uint32_t v1 = wait_vblank_change(v0, 300000);
+            have_ctl = v1 != v0;
+            host_log("video: control block probe %d: vblank counter %u -> %u%s", attempt + 1, v0, v1,
+                     have_ctl ? "" : " (not moving)");
+        }
     }
     if (have_ctl) {
         /* rough vblank rate, for the log and for the audio clock */
@@ -104,6 +128,9 @@ int video_init(unsigned long fb_phys, unsigned w, unsigned h, const char *dir, i
         double s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
         vblank_hz = 30.0 / s;
         host_log("video: control block found, two buffers at 0x%lx, vblank %.2f Hz", fb_phys, vblank_hz);
+        copier_run = true;
+        pin_to_cpu(0);
+        pthread_create(&copier, NULL, copier_main, NULL);
     } else {
         host_log("video: no control block, single %ux%u buffer at 0x%lx", w, h, fb_phys);
     }
@@ -114,6 +141,70 @@ bool   video_has_vsync(void) { return have_ctl; }
 double video_vblank_hz(void) { return vblank_hz; }
 
 const volatile uint32_t *video_joystick_words(void) { return have_ctl ? ctl + CTL_JOY0 : NULL; }
+
+static void pin_to_cpu(int cpu)
+{
+    cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof set, &set);   /* the calling thread */
+}
+
+static void *copier_main(void *arg)
+{
+    (void)arg;
+    /* Main_MiSTer busy-polls the FPGA on CPU 1 while a core is loaded (the
+     * daemon lowers its priority). The game thread gets CPU 0 to itself;
+     * the copier shares CPU 1 with Main's polling. */
+    pin_to_cpu(1);
+    for (;;) {
+        /* 1. wait until the FPGA has latched the last published buffer, so
+         *    the other one is free. Nothing is held during this wait: the
+         *    game keeps running at the audio clock and may replace the
+         *    frame waiting for us with a newer one. */
+        uint32_t v = ctl[CTL_VBLANK];
+        if (pending >= 0 && v == published_v) {
+            struct timespec w0, w1; clock_gettime(CLOCK_MONOTONIC, &w0);
+            v = wait_vblank_change(v, 20000);
+            clock_gettime(CLOCK_MONOTONIC, &w1);
+            wait_us_total += (w1.tv_sec - w0.tv_sec) * 1000000L + (w1.tv_nsec - w0.tv_nsec) / 1000;
+        }
+        /* 2. take the newest frame */
+        pthread_mutex_lock(&mtx);
+        while (copier_run && latest < 0) pthread_cond_wait(&cv, &mtx);
+        if (!copier_run) { pthread_mutex_unlock(&mtx); break; }
+        reading = latest; latest = -1;
+        unsigned w = staging_w, h = staging_h;
+        pthread_mutex_unlock(&mtx);
+
+        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        if (pending >= 0 && v == published_v) {
+            dropped++;                   /* the counter is not moving: no core? */
+        } else {
+            int target = pending < 0 ? 0 : pending ^ 1;
+            /* rows start on 64-byte boundaries in DDR: the mapping is device
+             * memory and the FPGA reads bursts; the stride is published */
+            unsigned stride = (w * 2 + 63) & ~63u;
+            if (w != cur_w || h != cur_h) {
+                ctl[CTL_WIDTH] = w; ctl[CTL_HEIGHT] = h; ctl[CTL_STRIDE] = stride;
+                cur_w = w; cur_h = h;
+                host_log("video: geometry %ux%u stride %u", w, h, stride);
+            }
+            uint8_t *dst = fb + target * FB_STRIDE_BUF;
+            for (unsigned y = 0; y < h; y++)
+                copy_row(dst + y * stride, staging[reading] + y * w * 2, w * 2);
+            ctl[CTL_PRESENT] = (uint32_t)target;
+            pending = target;
+            published_v = v;
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000; copy_n++;
+
+        pthread_mutex_lock(&mtx);
+        reading = -1;
+        pthread_cond_broadcast(&cv);
+        pthread_mutex_unlock(&mtx);
+    }
+    return NULL;
+}
 
 static void dump_ppm(const uint16_t *src, unsigned w, unsigned h, size_t pitch)
 {
@@ -140,47 +231,39 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
     if (!data) return;          /* duplicate frame */
     frames++;
     if (fb) {
-        struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        long wait_before = wait_us_total;
         const uint8_t *src = data;
         if (have_ctl) {
-            if (w > 2048 || h * w * 2 > FB_STRIDE_BUF) { w = w > 2048 ? 2048 : w; h = FB_STRIDE_BUF / (w * 2); }
-            /* The FPGA latches the published index at each vblank. Until it
-             * has, the published buffer is about to be shown and the other one
-             * is on screen, so there is nowhere to draw: wait for that vblank
-             * (at most one frame; the audio buffer absorbs it, and its rate is
-             * tied to the vblank so the two clocks agree). Drop only if the
-             * counter is not moving at all. */
-            uint32_t v = ctl[CTL_VBLANK];
-            if (pending >= 0 && v == published_v) {
-                struct timespec w0, w1; clock_gettime(CLOCK_MONOTONIC, &w0);
-                v = wait_vblank_change(v, 20000);
-                clock_gettime(CLOCK_MONOTONIC, &w1);
-                wait_us_total += (w1.tv_sec - w0.tv_sec) * 1000000L + (w1.tv_nsec - w0.tv_nsec) / 1000;
+            if (w > 2048) w = 2048;
+            if (h * ((w * 2 + 63) & ~63u) > FB_STRIDE_BUF) h = FB_STRIDE_BUF / ((w * 2 + 63) & ~63u);
+            pthread_mutex_lock(&mtx);
+            if (!staging[0] || staging_w != w || staging_h != h) {
+                while (reading >= 0) pthread_cond_wait(&cv, &mtx);    /* resize only when the copier is idle */
+                free(staging[0]); free(staging[1]);
+                staging[0] = malloc((size_t)w * h * 2); staging[1] = malloc((size_t)w * h * 2);
+                staging_w = w; staging_h = h; latest = -1;
             }
-            if (pending >= 0 && v == published_v) { dropped++; goto done; }
-            int target = pending < 0 ? 0 : pending ^ 1;
-            uint8_t *dst = fb + target * FB_STRIDE_BUF;
+            /* write the buffer the copier is not reading; if a frame is still
+             * waiting there it is simply replaced (the game outran a vblank) */
+            int idx = reading == 0 ? 1 : 0;
+            if (latest >= 0 && latest != idx) { /* both hold data: overwrite the waiting one */ }
+            else if (latest == idx) replaced++;
+            pthread_mutex_unlock(&mtx);
             for (unsigned y = 0; y < h; y++)
-                copy_row(dst + y * w * 2, src + y * pitch, w * 2);
-            if (w != cur_w || h != cur_h) {
-                ctl[CTL_WIDTH] = w; ctl[CTL_HEIGHT] = h; ctl[CTL_STRIDE] = w * 2;
-                cur_w = w; cur_h = h;
-                host_log("video: geometry %ux%u", w, h);
-            }
-            ctl[CTL_PRESENT] = (uint32_t)target;
-            pending = target;
-            published_v = v;
+                memcpy(staging[idx] + y * w * 2, src + y * pitch, w * 2);   /* cached: cheap */
+            pthread_mutex_lock(&mtx);
+            latest = idx;
+            pthread_cond_broadcast(&cv);
+            pthread_mutex_unlock(&mtx);
         } else {
+            struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
             unsigned cw = w < fixed_w ? w : fixed_w, ch = h < fixed_h ? h : fixed_h;
             unsigned ox = (fixed_w - cw) / 2, oy = (fixed_h - ch) / 2;
             uint16_t *dst = (uint16_t *)fb;
             for (unsigned y = 0; y < ch; y++)
                 copy_row((uint8_t *)(dst + (oy + y) * fixed_w + ox), src + y * pitch, cw * 2);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000; copy_n++;
         }
-done:
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-        copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000 - (wait_us_total - wait_before); copy_n++;
     }
     if (dump_every > 0 && dumpdir && frames % dump_every == 0)
         dump_ppm(data, w, h, pitch);
@@ -195,10 +278,15 @@ long video_copy_us(void)
 
 long video_wait_us_take(void) { long w = wait_us_total; wait_us_total = 0; return w; }
 
-unsigned video_dropped(void) { unsigned d = dropped; dropped = 0; return d; }
+unsigned video_dropped(void) { unsigned d = dropped + replaced; dropped = 0; replaced = 0; return d; }
 
 void video_close(void)
 {
+    if (copier_run) {
+        pthread_mutex_lock(&mtx); copier_run = false; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mtx);
+        pthread_join(copier, NULL);
+        free(staging[0]); free(staging[1]); staging[0] = staging[1] = NULL;
+    }
     if (ctl) { ctl[CTL_PRESENT] = 0; munmap((void *)ctl, 4096); }
     if (fb) munmap(fb, fb_len);
     if (memfd >= 0) close(memfd);

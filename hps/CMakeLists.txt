@@ -7,6 +7,10 @@ set(CMAKE_C_STANDARD 11)
 # libraries are unsupported before the submodule is configured: its
 # libretro/CMakeLists.txt then picks STATIC for bennugd_libretro.
 set_property(GLOBAL PROPERTY TARGET_SUPPORTS_SHARED_LIBS FALSE)
+# zlib-ng's NEON adler32 issues a VLD1 with a 256-bit alignment qualifier on
+# a buffer that is only 16-byte aligned: SIGBUS (alignment fault) when SorR
+# inflates the next level's data. The C paths are fast enough here.
+set(WITH_NEON OFF CACHE BOOL "zlib-ng NEON: off, see the comment above" FORCE)
 # The core stamps its version from git; with us as the root project that
 # would read this repo, so point it at the submodule as upstream intends.
 set(GIT_WORKING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/BennuGD_libretro")

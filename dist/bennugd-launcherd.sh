@@ -35,13 +35,35 @@ stop_game() {
     for p in $(pidof bennugd 2>/dev/null); do kill -KILL "$p" 2>/dev/null; done
     [ -n "$pid" ] && wait "$pid" 2>/dev/null
     pid=""
+    sync    # the game's save files: do not leave them in the card's write cache
 }
 
 # only one of us: an older instance would keep launching its own frontend
 for p in $(ps | grep "[b]ennugd-launcherd" | awk '{print $1}'); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
 log "daemon start (pid $$)"
+# adopt a frontend an earlier daemon left running, so restarting the daemon
+# does not restart the game under the player
+for p in $(pidof bennugd 2>/dev/null | tr ' ' '\n' | sort -n); do   # lowest pid: the game, not its pre-read child
+    args=$(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null)
+    case "$args" in
+        *" --core "*)
+            pid=$p
+            last_core=$(cat /tmp/CORENAME 2>/dev/null)
+            # the frontend's parser splits "game=path" in its argv, so accept both spellings
+            last_game=$(echo "$args" | sed -n 's/.*game[= ]\([^ ]*\).*/\1/p')
+            log "adopted pid $pid game=${last_game:-<cfg default>}"
+            break ;;
+    esac
+done
 while :; do
     core=$(cat /tmp/CORENAME 2>/dev/null)
+    # a crashed frontend leaves a black screen with the core still loaded: restart it
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null
+        sync
+        log "frontend pid $pid died (see bennugd.log), restarting"
+        pid=""; last_game="(restart)"
+    fi
     game=""
     if [ "$core" = "BennuGD" ]; then
         game=$(resolve_game)
@@ -53,15 +75,20 @@ while :; do
     if [ "$core" != "$last_core" ] || [ "$game" != "$last_game" ]; then
         stop_game
         if [ "$core" = "BennuGD" ]; then
-            # prof=: the built-in 1 kHz sampler, negligible cost, keeps only over-budget frames
+            # (no prof= here: the sampler's timer signal disturbs the audio pacing;
+            #  put prof=/media/fat/bennugd/prof.bin in bennugd.cfg for a profiling session)
             if [ -n "$game" ]; then
-                "$BIN" --core "game=$game" prof=/media/fat/bennugd/prof.bin &
+                "$BIN" --core "game=$game" &
             else
-                "$BIN" --core prof=/media/fat/bennugd/prof.bin &
+                "$BIN" --core &
             fi
             pid=$!
+            # Main busy-polls the FPGA on one core the whole time our core is
+            # loaded; the game needs that core more than Main's polling does
+            for m in $(pidof MiSTer); do renice 10 "$m" >/dev/null 2>&1; done
             log "core $core: started pid $pid game=${game:-<cfg default>}"
         else
+            for m in $(pidof MiSTer); do renice 0 "$m" >/dev/null 2>&1; done
             log "core $core: frontend stopped"
         fi
         last_core=$core

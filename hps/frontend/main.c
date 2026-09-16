@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <ucontext.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -181,6 +182,18 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames)
 }
 static void on_signal(int sig) { (void)sig; stop = 2; }   /* 2: killed from outside, do not ask for the menu */
 
+/* A crash leaves a black screen and, without this, nothing to go on: the
+ * kernel logs the data address but not where the code was. Log both, then
+ * die the normal way. */
+static void on_crash(int sig, siginfo_t *si, void *ctx)
+{
+    ucontext_t *uc = ctx;
+    host_log("CRASH: signal %d at address %p, pc 0x%08lx lr 0x%08lx (symbolise pc with tools/profsym.py or nm on hps/out/bennugd)",
+             sig, si->si_addr, (unsigned long)uc->uc_mcontext.arm_pc, (unsigned long)uc->uc_mcontext.arm_lr);
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
 static long rss_kb(void)
 {
     long pages = 0; FILE *f = fopen("/proc/self/statm", "r");
@@ -196,6 +209,7 @@ static void prewarm_file(const char *path)
 {
     signal(SIGCHLD, SIG_IGN);      /* the child is reaped by the kernel, no zombie */
     if (fork() != 0) return;
+    signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);   /* the parent's handlers would make the child ignore a kill */
     setpriority(PRIO_PROCESS, 0, 19);
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
@@ -231,10 +245,12 @@ int main(int argc, char **argv)
     if (core_mode) { opt.fb = FB_PHYS; opt.menu = 1; opt.log = strdup("/media/fat/bennugd/bennugd.log"); read_cfg(CFG_PATH); }
     else opt.game = strdup(argv[1]);
     for (int i = 2; i < argc; i++) {
-        char *eq = strchr(argv[i], '=');
+        char *arg = strdup(argv[i]);       /* a copy: cutting argv itself would change what ps shows */
+        char *eq = strchr(arg, '=');
         if (!eq) { usage(); return 2; }
         *eq = 0;
-        if (apply_setting(argv[i], eq + 1) < 0) { fprintf(stderr, "unknown setting %s\n", argv[i]); return 2; }
+        if (apply_setting(arg, eq + 1) < 0) { fprintf(stderr, "unknown setting %s\n", arg); return 2; }
+        free(arg);
     }
     if (opt.log) { logf = fopen(opt.log, "a"); if (!logf) fprintf(stderr, "cannot open log %s\n", opt.log); }
     if (!opt.game) { host_log("no game= configured"); if (opt.menu) launcher_return_to_menu(); return 2; }
@@ -246,6 +262,11 @@ int main(int argc, char **argv)
     host_log("bennugd: game %s (dir %s)", opt.game, game_dir);
 
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
+    {
+        struct sigaction sa = { .sa_sigaction = on_crash, .sa_flags = SA_SIGINFO };
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGSEGV, &sa, NULL); sigaction(SIGBUS, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGFPE, &sa, NULL);
+    }
 
     retro_set_environment(env_cb);
     retro_set_video_refresh(video_cb);
@@ -307,7 +328,8 @@ int main(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &tr);
         audio_flush();                 /* blocks on the ALSA buffer: this is the audio clock */
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        long run_us = (tr.tv_sec - t0.tv_sec) * 1000000L + (tr.tv_nsec - t0.tv_nsec) / 1000 - video_wait_us_take();
+        long run_us = (tr.tv_sec - t0.tv_sec) * 1000000L + (tr.tv_nsec - t0.tv_nsec) / 1000;
+        video_wait_us_take();   /* the copier's vblank wait; not on this thread any more, keep the counter drained */
         long us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
         times[nt] = us; runs[nt] = run_us; nt++; if (run_us > worst) worst = run_us;
         if (opt.prof) { prof_frame_end(run_us > 16700); if (frame % 3600 == 0) prof_dump(); }
@@ -335,6 +357,7 @@ int main(int argc, char **argv)
     if (opt.prof) prof_dump();
     retro_unload_game();
     retro_deinit();
+    sync();                         /* save files out of the page cache before anyone pulls the plug */
     input_close(); audio_close(); video_close();
     if (gfd >= 0) close(gfd);
     if (opt.menu && stop != 2) launcher_return_to_menu();

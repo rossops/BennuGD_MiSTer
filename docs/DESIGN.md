@@ -204,8 +204,66 @@ keeps the old one). The MiSTer's `/tmp` is a 246 MB tmpfs.
     underrun, and `audio.c` nudges one frame per flush to hold the queued
     level near the primed level (`level` in the stats). Needed because
     with vsync the game produces audio exactly as fast as it is consumed.
+- **The second core was not free (00:50).** `top` on the device: Main_MiSTer
+  at ~90 % of a core, pinned to CPU 1, busy-polling the FPGA the whole
+  time a non-menu core is loaded; our game thread, the copier thread and
+  the pre-read shared what was left. Two changes: the daemon renices Main
+  to 10 while the BennuGD core is loaded (back to 0 when it unloads), and
+  the frontend pins the game thread to CPU 0 and the copier thread to
+  CPU 1, where it only has to beat Main's polling. The uncached 2.5 ms
+  framebuffer copy now runs on the copier (video.c: video_present copies
+  into a cached staging buffer and hands over; the copier does the DDR
+  copy, the flip and the vblank wait). After that the frame total sat on
+  the vblank period with a flat underrun count in the same level.
   Remaining levers: the translucent span blend (arithmetic instead of the
-  two tables, NEON where the fetch is linear), and the interpreter loop. The
+  two tables, NEON where the fetch is linear), and the interpreter loop.
+  Caller attribution by LR in tools/profsym.py is not trustworthy for
+  non-leaf functions; ignore that section unless the callee is a leaf.
+- **Scene transitions (01:30):** a 350 ms level-load frame drained the
+  audio buffer, and from then on the game was paced by the copier's
+  vblank wait instead of the audio clock. The kernel's dummy card runs
+  about 0.7 % fast against the rate asked for, the one-frame-per-flush
+  regulation covers 0.14 %, so the buffer bled to an underrun every few
+  seconds. Fix: the copier never holds the game back. Two cached staging
+  buffers; the game always writes the one the copier is not reading, a
+  newer frame replaces a waiting one, and the copier shows the newest at
+  each vblank (`dropped` in the stats counts replacements, about 0.5 %).
+  Audio is the only clock. Six minutes of play across transitions after
+  that: 1 underrun, queued level 62-89 ms. The user confirmed the
+  transition stutter gone.
+- **Crash after the first boss (02:10):** `Unhandled fault: alignment
+  exception (0x011) at 0x0183ad50` in dmesg, the frontend gone, black
+  screen. The address is in the heap (the fb mapping is at 0xb6386000),
+  so it is the core's code, on an access the kernel's alignment fixup
+  does not emulate. The frontend now logs pc/lr on SIGSEGV/SIGBUS/SIGILL
+  (`CRASH:` line in bennugd.log, symbolise with the symtab) and the
+  daemon restarts a frontend that died with the core still loaded. Rows
+  in DDR are 64-byte aligned (stride published in the control block).
+  Second crash gave the pc: `adler32_neon` in zlib-ng, instruction
+  `f427623d` = VLD1.8 {d6-d9} with a `:256` alignment qualifier, on a
+  16-byte-aligned buffer. zlib-ng's NEON adler32 assumes 32-byte
+  alignment it is not given. Fixed by building zlib-ng with
+  `WITH_NEON=OFF` (hps/CMakeLists.txt); the C checksum costs nothing
+  noticeable. Worth reporting to zlib-ng / BennuGD_libretro.
+- **Double-speed gameplay after the level 2 truck scene (02:30):** the
+  core logged `av info 416x240 @ 120 fps`. SorR's `mod/system.txt` mode
+  BORDERLESS_SYNC (the only mode that renders at native 416x240; AUTO and
+  BORDERLESS render 832x480, a 2x scale the interpreter would pay four
+  times over) calls `set_fps(120)` and relies on the PC's 60 Hz vsync to
+  pace the game. The libretro core only ever raises its reported rate and
+  BennuGD's own limiter is off while the two match, so the game ran 120
+  logic frames a second with the audio per frame halved (sound normal,
+  play doubled). `hps/patches/0003` stops the core reporting more than
+  the frontend's refresh rate; the audio upload already follows the
+  reported rate, so the game runs 60 logic frames a second, as on a
+  vsynced PC. Keep BORDERLESS_SYNC in system.txt.
+- **The sampler itself causes stutter (01:05).** With `prof=` on, a light
+  scene (2 ms frames) still lost about five audio periods a second and the
+  queued level kept collapsing; the same scene without it held a flat
+  underrun count at 72-89 ms queued. The 1 kHz SIGPROF interrupts the
+  blocking ALSA write and the pacing waits. So the daemon no longer
+  passes `prof=`; enable it in bennugd.cfg for a profiling session only,
+  and treat the audio counters from such a session as meaningless. The
   in-process sampler (`prof=<file>` plus `tools/profsym.py`) makes each
   experiment a three-minute measurement on the real hardware.
 

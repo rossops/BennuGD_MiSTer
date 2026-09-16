@@ -8,6 +8,7 @@
 #include "host.h"
 #include <dlfcn.h>
 #include <string.h>
+#include <unistd.h>
 
 #define ACC_MAX     16384u    /* input frames buffered between flushes */
 #define BUFFER_MS   100u      /* ALSA buffer: rides over the 20-30 ms frame spikes seen in play */
@@ -92,6 +93,7 @@ int audio_init(const char *dev, unsigned rate)
     unsigned r = rate; int dir = 0;
     unsigned long buf = (unsigned long)rate * BUFFER_MS / 1000, per = (unsigned long)rate * PERIOD_MS / 1000;
     if (p_hw_malloc(&hw) < 0) { p_close(pcm); pcm = NULL; return -1; }
+retry:
     if ((err = p_hw_any(pcm, hw)) < 0 ||
         (err = p_hw_resample(pcm, hw, 1)) < 0 ||
         (err = p_hw_access(pcm, hw, 3 /* RW_INTERLEAVED */)) < 0 ||
@@ -101,7 +103,10 @@ int audio_init(const char *dev, unsigned rate)
         (err = p_hw_buffer_near(pcm, hw, &buf)) < 0 ||
         (err = p_hw_period_near(pcm, hw, &per, &dir)) < 0 ||
         (err = p_hw_apply(pcm, hw)) < 0) {
-        host_log("audio: hw params: %s", p_strerror(err));
+        /* seen once right after boot (EINVAL): the card was not ready yet */
+        static int attempts;
+        host_log("audio: hw params: %s (attempt %d)", p_strerror(err), attempts + 1);
+        if (++attempts < 5) { sleep(1); r = rate; buf = (unsigned long)rate * BUFFER_MS / 1000; per = (unsigned long)rate * PERIOD_MS / 1000; goto retry; }
         p_hw_free(hw); p_close(pcm); pcm = NULL; return -1;
     }
     p_hw_free(hw);
