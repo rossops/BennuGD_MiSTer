@@ -45,6 +45,17 @@ Leave the `.exe` and `.dll` files behind, they are Windows only. The
 folder name `SORRv52` and the file name `SorR.dat` matter: the menu entry
 points at them.
 
+This is the file that was tested. Check yours before going further; a
+different version or a modded `.dat` is untested here:
+
+| file | size | CRC32 | MD5 |
+|---|---|---|---|
+| `SorR.dat` (v5.2) | 320,091,685 bytes | `1b1d6221` | `bce446c9c5bd86cc345a01917967e404` |
+
+On the MiSTer over ssh: `md5sum /media/fat/games/BennuGD/SORRv52/SorR.dat`.
+On a PC, any checksum tool will do (7-Zip's CRC option, or `certutil
+-hashfile SorR.dat MD5` on Windows).
+
 **2. Set the game's display mode.** Open
 `/media/fat/games/BennuGD/SORRv52/mod/system.txt` in a text editor. Under
 the line `// FULL SCREEN WIDE: AUTO, DESKTOP, BORDERLESS, BORDERLESS_SYNC`
