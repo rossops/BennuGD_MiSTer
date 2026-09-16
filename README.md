@@ -1,5 +1,7 @@
 # BennuGD for MiSTer
 
+![Streets of Rage Remake title screen, captured from the MiSTer's HDMI output](docs/screenshots/title.jpg)
+
 Streets of Rage Remake 5.2 on a MiSTer. The FPGA carries the video, audio
 and controller plumbing; the DE10-Nano's ARM side runs the BennuGD
 interpreter that the game was written for. It is one core, and any BennuGD
@@ -12,6 +14,12 @@ scenes still run below 60 fps because the interpreter is out of CPU there,
 only one pad has been tried, only HDMI output has been checked, and other
 BennuGD games have not been tried at all. Expect rough edges and please
 report what you find.
+
+| ![Main menu](docs/screenshots/main-menu.jpg) | ![Stage 36, Dance Club](docs/screenshots/dance-club.jpg) | ![Intro](docs/screenshots/intro.jpg) |
+|:--:|:--:|:--:|
+| Main menu | Stage 36, Dance Club | Intro |
+
+All captures are from the MiSTer over HDMI, through a capture card.
 
 ## Installing Streets of Rage Remake 5.2
 
