@@ -21,7 +21,7 @@ done
 cmake -B "$BUILD_DIR" -S "$HERE" \
     -DCMAKE_TOOLCHAIN_FILE="$HERE/cmake/zig.toolchain.arm-linux-gnueabihf-a9" \
     -DCMAKE_BUILD_TYPE=Release
-cmake --build "$BUILD_DIR" -j"$(sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 mkdir -p "$HERE/out"
 cp "$BUILD_DIR/bennugd" "$HERE/out/bennugd"
 file "$HERE/out/bennugd"

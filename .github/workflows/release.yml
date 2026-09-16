@@ -1,0 +1,63 @@
+# Builds the ARM side with the same script used on the Mac, packages the
+# card-layout zip with the committed .rbf, and on a tag publishes a release.
+# The FPGA build needs Quartus and stays a committed file in releases/.
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+    tags: ['alpha-*', 'v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  hps:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install zig 0.14.0
+        run: |
+          curl -sSL https://ziglang.org/download/0.14.0/zig-linux-x86_64-0.14.0.tar.xz | tar xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/zig-linux-x86_64-0.14.0" >> "$GITHUB_PATH"
+
+      - name: Build the ARM binary
+        run: ZIG_DIR="$RUNNER_TEMP/zig-linux-x86_64-0.14.0" BUILD_DIR="$RUNNER_TEMP/build" hps/build.sh
+
+      - name: Package the card-layout zip
+        id: pkg
+        run: |
+          set -e
+          RBF=$(ls releases/BennuGD_*.rbf | sort | tail -1)
+          S="$RUNNER_TEMP/rel"
+          mkdir -p "$S/bennugd/mgl" "$S/_Other/_BennuGD" "$S/Scripts"
+          cp hps/out/bennugd dist/bennugd.cfg dist/bennugd-launcherd.sh dist/install.sh "$S/bennugd/"
+          cp dist/mgl/*.mgl "$S/bennugd/mgl/"
+          cp dist/mgl/*.mgl "$RBF" "$S/_Other/_BennuGD/"
+          cp dist/BennuGD_install.sh "$S/Scripts/"
+          chmod +x "$S"/bennugd/bennugd "$S"/bennugd/*.sh "$S"/Scripts/*.sh
+          case "$GITHUB_REF" in
+            refs/tags/*) NAME="BennuGD_MiSTer_${GITHUB_REF_NAME}.zip" ;;
+            *)           NAME="BennuGD_MiSTer_${GITHUB_SHA::7}.zip" ;;
+          esac
+          (cd "$S" && zip -qr "$GITHUB_WORKSPACE/$NAME" bennugd _Other Scripts)
+          echo "zip=$NAME" >> "$GITHUB_OUTPUT"
+          echo "rbf=$RBF" >> "$GITHUB_OUTPUT"
+          unzip -l "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.zip }}
+          path: ${{ steps.pkg.outputs.zip }}
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ startsWith(github.ref_name, 'alpha-') }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.pkg.outputs.zip }}
+            ${{ steps.pkg.outputs.rbf }}
