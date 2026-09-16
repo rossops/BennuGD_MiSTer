@@ -1,0 +1,56 @@
+diff --git a/core/bgdrtm/include/bgdrtm.h b/core/bgdrtm/include/bgdrtm.h
+index 8bcc9d4..e16573a 100644
+--- a/core/bgdrtm/include/bgdrtm.h
++++ b/core/bgdrtm/include/bgdrtm.h
+@@ -42,8 +42,16 @@
+ 
+ /* --------------------------------------------------------------------------- */
+ 
+-extern void * globaldata ;
+-extern void * localdata ;
++/* Globals the interpreter loop reads per opcode. In the libretro build
++   (position independent code, linked into one executable) mark them hidden
++   so the compiler addresses them pc-relative instead of through the GOT. */
++#if LIBRETRO_CORE && defined(__GNUC__)
++#define BGDRTM_HOT_GLOBAL __attribute__((visibility("hidden")))
++#else
++#define BGDRTM_HOT_GLOBAL
++#endif
++extern BGDRTM_HOT_GLOBAL void * globaldata ;
++extern BGDRTM_HOT_GLOBAL void * localdata ;
+ extern int    local_size ;
+ extern int  * localstr ;
+ extern int    local_strings ;
+@@ -59,7 +67,7 @@ extern char *appexefullpath;
+ 
+ extern char *configfile;
+ 
+-extern int debug ;          /* 1 if running in debug mode */
++extern BGDRTM_HOT_GLOBAL int debug ;          /* 1 if running in debug mode */
+ 
+ /* Trace */
+ extern int exit_value;
+diff --git a/core/bgdrtm/src/interpreter.c b/core/bgdrtm/src/interpreter.c
+index 9d46047..8c34252 100644
+--- a/core/bgdrtm/src/interpreter.c
++++ b/core/bgdrtm/src/interpreter.c
+@@ -221,6 +221,11 @@ main_loop_instance_go:
+             goto break_all;
+         }
+ 
++#if !LIBRETRO_CORE
++        /* The libretro build has no debugger console; these two checks cost
++           a fifth of the interpreter loop on an ARM Cortex-A9, so they are
++           compiled out (debug is never set there and a `debug` statement in
++           the game would otherwise spin forever waiting for the console). */
+         if ( trace_sentence != -1 ) {
+              while( debugger_show_console ) {
+                 /* Hook */
+@@ -243,6 +248,7 @@ main_loop_instance_go:
+             mnemonic_dump( *ptr, ptr[1] );
+             fflush(stdout);
+         }
++#endif
+ 
+         switch ( *ptr )
+         {

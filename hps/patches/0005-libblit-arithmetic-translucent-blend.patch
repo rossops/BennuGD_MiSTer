@@ -1,0 +1,179 @@
+diff --git a/modules/libblit/g_blit.c b/modules/libblit/g_blit.c
+index 84e98f2..3ac4bbb 100644
+--- a/modules/libblit/g_blit.c
++++ b/modules/libblit/g_blit.c
+@@ -82,6 +82,34 @@ typedef int ( BLEND_FUNC )( int, int );
+ 
+ uint16_t  * ghost1;
+ uint16_t  * ghost2;
++
++/* Arithmetic form of the ghost1/ghost2 blend for RGB565 targets. The two
++   128 KB tables miss the L1 cache on nearly every pixel of a scaled or
++   translucent sprite on a Cortex-A9; the same result computed in registers
++   is several times faster. Used when the tables are alpha tables (per
++   component: ((c * f) >> 8), summed) or the 50 % colorghost table; a
++   per-graph blend_table still goes through the tables. */
++static int ghost_arith = 0 ;
++static uint32_t ghost_f1 = 128, ghost_f2 = 128 ;
++
++static void ghost_set_factors( int f1, int f2 )
++{
++    ghost_f1 = f1 ; ghost_f2 = f2 ;
++    ghost_arith = ( sys_pixel_format->Rmask == 0xF800 &&
++                    sys_pixel_format->Gmask == 0x07E0 &&
++                    sys_pixel_format->Bmask == 0x001F ) ;
++}
++
++static inline uint16_t ghost_blend16( uint32_t t, uint32_t d )
++{
++    /* r and b share one word (r at bit 16, b at bit 0): with f <= 256 the
++       products are 13 bits wide and cannot overlap */
++    uint32_t trb = (( t & 0xF800 ) << 5 ) | ( t & 0x1F ) ;
++    uint32_t drb = (( d & 0xF800 ) << 5 ) | ( d & 0x1F ) ;
++    uint32_t rb  = ((( trb * ghost_f1 ) >> 8 ) & 0x001F001F ) + ((( drb * ghost_f2 ) >> 8 ) & 0x001F001F ) ;
++    uint32_t g   = (((( t >> 5 ) & 0x3F ) * ghost_f1 ) >> 8 ) + (((( d >> 5 ) & 0x3F ) * ghost_f2 ) >> 8 ) ;
++    return ( uint16_t )((( rb >> 5 ) & 0xF800 ) | ( g << 5 ) | ( rb & 0x1F )) ;
++}
+ uint8_t   * ghost8;
+ 
+ uint32_t * pcolorequiv = NULL ;
+@@ -610,6 +638,18 @@ static void draw_span_16to16_translucent( GRAPH * dest, GRAPH * orig, int x, int
+     int cs = s, ct = t;
+     uint16_t * tex ;
+ 
++    if ( ghost_arith )
++    {
++        while ( pixels-- )
++        {
++            tex = ( uint16_t * ) orig->data + ( orig->pitch * ( ct >> 16 ) >> 1 ) + ( cs >> 16 );
++            if ( *tex ) *ptr = ghost_blend16( *tex, *ptr );
++            ptr++;
++            cs += incs, ct += inct;
++        }
++        return;
++    }
++
+     while ( pixels-- )
+     {
+         tex = ( uint16_t * ) orig->data + ( orig->pitch * ( ct >> 16 ) >> 1 ) + ( cs >> 16 );
+@@ -1265,6 +1305,21 @@ static void draw_hspan_16to16_translucent( uint16_t *scr, uint16_t * tex, int pi
+     int i;
+     uint8_t * _scr = ( uint8_t * ) scr, * _tex = ( uint8_t * ) tex;
+ 
++    if ( ghost_arith )
++    {
++        while ( l-- )
++        {
++            for ( i = pixels; i--; )
++            {
++                if ( *tex ) *scr = ghost_blend16( *tex, *scr );
++                scr++;
++                tex += incs;
++            }
++            scr = ( uint16_t * )( _scr += scr_inc ); tex = ( uint16_t * )( _tex += tex_inc );
++        }
++        return;
++    }
++
+     while ( l-- )
+     {
+         for ( i = pixels; i--; )
+@@ -1954,6 +2009,7 @@ void gr_rotated_blit(
+         if ( dest->format->depth == 32 ) return ;
+         ghost1 = ( uint16_t * ) gr->blend_table ;
+         ghost2 = ( uint16_t * )( gr->blend_table + 65536 ) ;
++        ghost_arith = 0 ;
+         flags |= B_TRANSLUCENT ;
+     }
+     else if ( flags & B_ALPHA )
+@@ -1977,11 +2033,15 @@ void gr_rotated_blit(
+             {
+                 ghost1 = gr_alpha16((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 );
+                 ghost2 = gr_alpha16( 255 - ((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ) );
++                ghost_set_factors( gr_alpha16_factor((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ),
++                                   gr_alpha16_factor( 255 - ((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ) ) );
+             }
+             else
+             {
+                 ghost1 = gr_alpha16(( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT );
+                 ghost2 = gr_alpha16( 255 - (( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) );
++                ghost_set_factors( gr_alpha16_factor(( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ),
++                                   gr_alpha16_factor( 255 - (( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) ) );
+             }
+         }
+         else if ( dest->format->depth == 8 )
+@@ -2003,6 +2063,7 @@ void gr_rotated_blit(
+         _factor = 128 ;
+         _factor2 = 128 ;
+         ghost1 = ghost2 = colorghost ;
++        ghost_set_factors( 128, 128 ) ;
+         ghost8 = ( uint8_t * ) trans_table ;
+     }
+ 
+@@ -2547,6 +2608,7 @@ void gr_blit( GRAPH * dest, REGION * clip, int scrx, int scry, int flags, GRAPH
+         if ( dest->format->depth == 32 ) return ;
+         ghost1 = ( uint16_t * ) gr->blend_table ;
+         ghost2 = ( uint16_t * )( gr->blend_table + 65536 );
++        ghost_arith = 0 ;
+         flags |= B_TRANSLUCENT ;
+     }
+     else if ( flags & B_ALPHA )
+@@ -2570,11 +2632,15 @@ void gr_blit( GRAPH * dest, REGION * clip, int scrx, int scry, int flags, GRAPH
+             {
+                 ghost1 = gr_alpha16((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 );
+                 ghost2 = gr_alpha16( 255 - ((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ) );
++                ghost_set_factors( gr_alpha16_factor((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ),
++                                   gr_alpha16_factor( 255 - ((( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) >> 1 ) ) );
+             }
+             else
+             {
+                 ghost1 = gr_alpha16(( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT );
+                 ghost2 = gr_alpha16( 255 - (( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) );
++                ghost_set_factors( gr_alpha16_factor(( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ),
++                                   gr_alpha16_factor( 255 - (( flags & B_ALPHA_MASK ) >> B_ALPHA_SHIFT ) ) );
+             }
+         }
+         else if ( dest->format->depth == 8 )
+@@ -2596,6 +2662,7 @@ void gr_blit( GRAPH * dest, REGION * clip, int scrx, int scry, int flags, GRAPH
+         _factor = 128 ;
+         _factor2 = 128 ;
+         ghost1 = ghost2 = colorghost ;
++        ghost_set_factors( 128, 128 ) ;
+         ghost8 = ( uint8_t * ) trans_table ;
+     }
+ 
+diff --git a/modules/libgrbase/g_conversion.c b/modules/libgrbase/g_conversion.c
+index 81eafa4..f568dfb 100644
+--- a/modules/libgrbase/g_conversion.c
++++ b/modules/libgrbase/g_conversion.c
+@@ -457,6 +457,18 @@ uint16_t * gr_alpha16( int alpha )
+     return alpha16[ alpha ];
+ }
+ 
++/* The blend factor (0..256) that gr_alpha16( alpha ) applies to each colour
++   component, so a blitter can do the same blend arithmetically. */
++int gr_alpha16_factor( int alpha )
++{
++    int inc, factor;
++    if ( !alpha16_tables_ok ) init_alpha16_tables( GLODWORD( libgrbase, ALPHA_STEPS ) );
++    inc = 256 / alpha16_tables_ok;
++    factor = ( alpha / inc ) * inc + inc / 2;
++    if ( factor > 255 ) factor = 256;
++    return factor;
++}
++
+ /* --------------------------------------------------------------------------- */
+ /*
+  *  FUNCTION : gr_alpha8
+diff --git a/modules/libgrbase/g_conversion.h b/modules/libgrbase/g_conversion.h
+index 212db97..33931bc 100644
+--- a/modules/libgrbase/g_conversion.h
++++ b/modules/libgrbase/g_conversion.h
+@@ -35,6 +35,7 @@ extern void gr_convert16_ScreenTo565( uint16_t * ptr, int len );
+ extern void gr_convert16_565ToScreen( uint16_t * ptr, int len );
+ extern void gr_fade16( GRAPH * graph, int r, int g, int b );
+ extern uint16_t * gr_alpha16( int alpha );
++extern int gr_alpha16_factor( int alpha );
+ extern uint8_t * gr_alpha8( int alpha );
+ 
+ #endif

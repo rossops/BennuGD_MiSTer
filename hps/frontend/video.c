@@ -226,6 +226,55 @@ static void dump_ppm(const uint16_t *src, unsigned w, unsigned h, size_t pitch)
     fclose(f);
 }
 
+/* --- on-screen counter, fps=1 in bennugd.cfg (throwaway diagnostics) -----
+ * Top right: frames presented in the last second, then the longest
+ * interpreter frame of that second in ms. Stamped into the cached staging
+ * copy, so the game's own surface is untouched. */
+static int      ov_on;
+static long     ov_run_us, ov_run_max;
+static unsigned ov_frames;
+static int      ov_fps, ov_ms;
+static struct timespec ov_t0;
+void video_overlay(int on) { ov_on = on; }
+void video_overlay_run_us(long us) { ov_run_us = us; if (us > ov_run_max) ov_run_max = us; }
+static const uint8_t ov_font[10][5] = {   /* 3x5 digits, msb = left */
+    {7,5,5,5,7},{2,6,2,2,7},{7,1,7,4,7},{7,1,7,1,7},{5,5,7,1,1},
+    {7,4,7,1,7},{7,4,7,5,7},{7,1,1,1,1},{7,5,7,5,7},{7,5,7,1,7}};
+static void ov_digit(uint16_t *buf, unsigned w, unsigned x, unsigned y, int d)
+{
+    for (unsigned r = 0; r < 5; r++)
+        for (unsigned c = 0; c < 3; c++)
+            if (ov_font[d][r] & (4 >> c))
+                for (unsigned dy = 0; dy < 2; dy++)
+                    for (unsigned dx = 0; dx < 2; dx++)
+                        buf[(y + r * 2 + dy) * w + x + c * 2 + dx] = 0xFFFF;
+}
+static void ov_num(uint16_t *buf, unsigned w, unsigned x, unsigned y, int v)
+{
+    if (v > 99) v = 99;
+    if (v < 0) v = 0;
+    ov_digit(buf, w, x, y, v / 10);
+    ov_digit(buf, w, x + 8, y, v % 10);
+}
+static void ov_draw(uint16_t *buf, unsigned w, unsigned h)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    ov_frames++;
+    long ms = (t.tv_sec - ov_t0.tv_sec) * 1000 + (t.tv_nsec - ov_t0.tv_nsec) / 1000000;
+    if (ov_t0.tv_sec == 0) { ov_t0 = t; ov_frames = 0; ov_run_max = 0; }
+    else if (ms >= 1000) {
+        ov_fps = (int)(ov_frames * 1000L / ms);
+        ov_ms  = (int)((ov_run_max + 500) / 1000);
+        ov_t0 = t; ov_frames = 0; ov_run_max = 0;
+    }
+    if (w < 48 || h < 16) return;
+    unsigned x0 = w - 44, y0 = 3;
+    for (unsigned y = y0; y < y0 + 14; y++)
+        for (unsigned x = x0; x < x0 + 42; x++) buf[y * w + x] = 0x0000;
+    ov_num(buf, w, x0 + 2, y0 + 2, ov_fps);
+    ov_num(buf, w, x0 + 24, y0 + 2, ov_ms);
+}
+
 void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
 {
     if (!data) return;          /* duplicate frame */
@@ -250,6 +299,7 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
             pthread_mutex_unlock(&mtx);
             for (unsigned y = 0; y < h; y++)
                 memcpy(staging[idx] + y * w * 2, src + y * pitch, w * 2);   /* cached: cheap */
+            if (ov_on) ov_draw((uint16_t *)staging[idx], w, h);
             pthread_mutex_lock(&mtx);
             latest = idx;
             pthread_cond_broadcast(&cv);
@@ -265,8 +315,10 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
             copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000; copy_n++;
         }
     }
-    if (dump_every > 0 && dumpdir && frames % dump_every == 0)
-        dump_ppm(data, w, h, pitch);
+    if (dump_every > 0 && dumpdir && frames % dump_every == 0) {
+        if (ov_on && have_ctl && latest >= 0) dump_ppm((const uint16_t *)staging[latest], w, h, w * 2);  /* with the overlay */
+        else dump_ppm(data, w, h, pitch);
+    }
 }
 
 long video_copy_us(void)

@@ -336,3 +336,67 @@ Surface: the core starts at 320x200, then SorR switches to 416x240
 (its widescreen mode). The fixed framebuffer is therefore 416x240 and
 narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
 `FB_HEIGHT` in BennuGD.sv must match).
+
+## 2026-09-16 afternoon: the interpreter and the translucent blend
+
+- **Tooling.** `tools/proflines.py <binary> <prof.bin> <function>` buckets
+  the sampler's pcs inside one function by source line (the binary already
+  carries DWARF line tables; Apple's `objdump -d -l` reads the ARM ELF, but
+  `--disassemble-symbols` stops at the first inline jump table, so the
+  script takes the range from `nm` and disassembles by address). Also:
+  the sampler counts the copier thread too (`copier_main` shows up at
+  10-13 %); ignore it, it is not on the game thread.
+- **Attract mode is not a repeatable workload.** The game's sequencing is
+  wall-clock based (SDL_GetTicks), so a load hitch shifts every later
+  scene, and a restart may resume into the last level instead of the intro
+  (SorR keeps a continue state). Two runs of the same binary five minutes
+  apart had different scenes at the same frame index; only the first
+  ~3600 frames (the intro) line up. A/B numbers from attract mode are
+  therefore indicative only; the user's heavy level is the real test.
+- **Interpreter loop overhead (line profile, baseline binary, resumed
+  level):** of instance_go's own samples, 15 % sat on
+  `if (trace_sentence != -1)`, 7 % on `if (debug > 0)`, 13 % on the
+  switch dispatch, 8 % on the status check and 5 % on `while (!must_exit)`.
+  Each of those globals was read through the GOT (literal -> GOT entry ->
+  value, three dependent loads): zig cc refuses `-fno-pic` for this
+  target ("the selected target requires position independent code"), and
+  `POSITION_INDEPENDENT_CODE OFF` only stops CMake adding `-fPIC`.
+  `-fdirect-access-external-data` is not honoured through zig either.
+  - Patch 0004: the trace/debug checks are compiled out under
+    `LIBRETRO_CORE` (nothing in the libretro build ever sets `debug`, and
+    a `debug` statement in a game would spin forever waiting for a console
+    that does not exist), and `globaldata`, `localdata`, `debug` get a
+    hidden-visibility attribute in bgdrtm.h (`BGDRTM_HOT_GLOBAL`).
+  - `hps/CMakeLists.txt` adds `-fvisibility=hidden` for everything, so
+    globals defined in the same file are addressed pc-relative
+    (`must_exit`, `ghost1/2`, the stack). GOT loads inside instance_go:
+    43 -> 27; the loop head is now must_exit, status, dispatch.
+- **Translucent sprites (patch 0005).** `draw_span_16to16_translucent`
+  (scaled/rotated) was 18 % of the slow-frame samples in the resumed level
+  and `draw_hspan_16to16_translucent` another 3.5 %. The blend is
+  `ghost1[tex] + ghost2[dst]`, two 128 KB tables that miss L1 on nearly
+  every pixel. When the tables are alpha tables (`gr_alpha16`) or the 50 %
+  `colorghost`, the same result is per component `((c * f) >> 8)` summed,
+  so g_blit.c now computes it in registers (r and b packed in one word,
+  13-bit products cannot overlap; the packed add cannot carry between
+  fields because floor(c*f1/256) + floor(c*f2/256) <= c). The factor comes
+  from a new `gr_alpha16_factor()` that mirrors the table quantisation
+  (`ALPHA_STEPS`, default 0 -> a single 50 % table). Verified bit-exact
+  against the table formula for every step count and 158k random pixel
+  pairs, and gated on the surface being RGB565; a per-graph `blend_table`
+  still uses the tables.
+- **Result so far.** Both binaries run 5+ minutes in attract with no crash.
+  Profile shares moved as expected (the translucent span is gone from the
+  top of the list, instance_go self time is 45-49 % of what is left). In
+  the only aligned window (the intro, frames 600-3600) run p50 8.1 -> 7.8
+  ms and p99 20.3 -> 17.4 ms; the heavy level has not been re-measured
+  (needs a player). What remains in instance_go is the per-opcode stack
+  traffic through `r->stack_ptr` in memory, the status check and the
+  dispatch itself; the next step there would be caching the stack pointer
+  in a register across the switch, which touches every opcode.
+- **fps=1 overlay (throwaway diagnostics).** video.c stamps two numbers
+  into the staged frame's top right: frames presented in the last second
+  and the longest interpreter frame of that second in ms. With it on, the
+  PPM dump (`dump_dir=` / `dump_every=`) captures the staged frame so the
+  overlay can be checked from a dump; reading the DDR buffer back through
+  `/dev/mem` with dd returns 0 bytes on this kernel.

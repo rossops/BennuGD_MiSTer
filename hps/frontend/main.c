@@ -37,7 +37,7 @@
 static struct {
     char *game, *log, *audio, *dump_dir, *prof;
     unsigned long fb;
-    int dump_every, frames, menu;
+    int dump_every, frames, menu, fps;
     struct { char *key, *val; } vars[MAX_VARS];
     int nvars;
 } opt = { .audio = "default" };
@@ -95,6 +95,7 @@ static int apply_setting(const char *key, const char *val)
     else if (!strcmp(key, "dump_every")) opt.dump_every = atoi(val);
     else if (!strcmp(key, "frames")) opt.frames = atoi(val);
     else if (!strcmp(key, "menu")) opt.menu = atoi(val);
+    else if (!strcmp(key, "fps")) opt.fps = atoi(val);
     else if (!strcmp(key, "prof")) opt.prof = strdup(val);
     else if (!strncmp(key, "opt.", 4)) set_var(key + 4, val);
     else return -1;
@@ -235,7 +236,7 @@ static void usage(void)
     fprintf(stderr,
         "usage: bennugd <game.dat|--core> [key=value ...]\n"
         "  game= log= audio=(default|none|<alsa device>) fb=0x22000000|0 dump_dir= dump_every=N\n"
-        "  frames=N menu=0|1 prof=<dump file> opt.<core option>=<value>\n");
+        "  frames=N menu=0|1 prof=<dump file> fps=0|1 opt.<core option>=<value>\n");
 }
 
 int main(int argc, char **argv)
@@ -317,6 +318,7 @@ int main(int argc, char **argv)
 
     prewarm_file(opt.game);
     if (opt.prof) prof_start(opt.prof);
+    video_overlay(opt.fps);
     long times[STAT_N], runs[STAT_N]; int nt = 0; long worst = 0;
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
     long frame = 0;
@@ -329,6 +331,7 @@ int main(int argc, char **argv)
         audio_flush();                 /* blocks on the ALSA buffer: this is the audio clock */
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long run_us = (tr.tv_sec - t0.tv_sec) * 1000000L + (tr.tv_nsec - t0.tv_nsec) / 1000;
+        video_overlay_run_us(run_us);
         video_wait_us_take();   /* the copier's vblank wait; not on this thread any more, keep the counter drained */
         long us = (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000;
         times[nt] = us; runs[nt] = run_us; nt++; if (run_us > worst) worst = run_us;

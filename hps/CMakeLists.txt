@@ -14,6 +14,12 @@ set(WITH_NEON OFF CACHE BOOL "zlib-ng NEON: off, see the comment above" FORCE)
 # The core stamps its version from git; with us as the root project that
 # would read this repo, so point it at the submodule as upstream intends.
 set(GIT_WORKING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/BennuGD_libretro")
+# zig cc insists on position independent code for this target, so globals
+# would be read through the GOT (three dependent loads each) in the
+# interpreter loop and the blitters. Hidden visibility lets the compiler
+# address every global defined in the same file pc-relative; the hot
+# externs carry the attribute themselves (BGDRTM_HOT_GLOBAL in bgdrtm.h).
+add_compile_options(-fvisibility=hidden)
 add_subdirectory(BennuGD_libretro EXCLUDE_FROM_ALL)
 
 # Upstream builds everything -fPIC for the shared core. We link it into an

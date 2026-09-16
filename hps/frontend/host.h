@@ -21,6 +21,8 @@ double video_vblank_hz(void); /* measured at init, 0 without control block */
 unsigned video_dropped(void); /* frames dropped since last call */
 long video_wait_us_take(void); /* vblank wait time accumulated since last call, then reset */
 const volatile uint32_t *video_joystick_words(void);  /* 4 hps_io joystick words, or NULL */
+void video_overlay(int on);        /* fps=1: frames/s and worst run ms, top right */
+void video_overlay_run_us(long us);
 void video_close(void);
 
 /* audio.c: dev is an ALSA device name ("default"); NULL or "none" disables.
