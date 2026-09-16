@@ -94,7 +94,9 @@ the game.
 
 Saves go to the game's own `savegame` folder, as on a PC. Wait a moment
 after a save before powering off; the card is flushed when the game
-stops.
+stops. To test the whole game without playing it through, `saves/` has
+an everything-unlocked profile and the steps to install it (back up your
+own save first).
 
 ## Updating with update_all
 
