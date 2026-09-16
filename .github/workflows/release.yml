@@ -49,6 +49,10 @@ jobs:
           echo "zip=$NAME" >> "$GITHUB_OUTPUT"
           echo "rbf=$RBF" >> "$GITHUB_OUTPUT"
           unzip -l "$NAME"
+          # the test saves as their own asset: never inside the card-root zip,
+          # a save must be a deliberate copy over the player's own
+          (cd saves && zip -qr "$GITHUB_WORKSPACE/SORRv52_unlocked_saves.zip" README.md SORRv52)
+          unzip -l SORRv52_unlocked_saves.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -64,3 +68,4 @@ jobs:
           files: |
             ${{ steps.pkg.outputs.zip }}
             ${{ steps.pkg.outputs.rbf }}
+            SORRv52_unlocked_saves.zip
