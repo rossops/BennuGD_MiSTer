@@ -1,0 +1,26 @@
+diff --git a/modules/librender/g_screen.c b/modules/librender/g_screen.c
+index 41bfb01..d90dc43 100644
+--- a/modules/librender/g_screen.c
++++ b/modules/librender/g_screen.c
+@@ -203,7 +203,20 @@ void gr_unlock_screen()
+         uint32_t * src32 = screen->pixels, * dst32 = scale_screen->pixels ;
+         int h, w;
+ 
+-        switch ( scale_screen->format->BitsPerPixel )
++        if ( scale_screen->w == screen->w && scale_screen->h == screen->h &&
++             scale_screen->format->BitsPerPixel == screen->format->BitsPerPixel &&
++             scale_resolution_orientation == 0 )
++        {
++            /* Same size, no rotation: the tables are the identity, so copy
++             * rows instead of gathering pixel by pixel. Streets of Rage
++             * Remake sets scale_resolution to its own screen size and paid
++             * about 7 % of every frame for this on a Cortex-A9. */
++            int bytes = screen->w * screen->format->BytesPerPixel;
++            for ( h = 0; h < screen->h; h++ )
++                memcpy( ( uint8_t * ) scale_screen->pixels + h * scale_screen->pitch,
++                        ( uint8_t * ) screen->pixels + h * screen->pitch, bytes );
++        }
++        else switch ( scale_screen->format->BitsPerPixel )
+         {
+             case    8:
+                     if ( scale_resolution_orientation == 1 || scale_resolution_orientation == 3 )

@@ -17,6 +17,22 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include <arm_neon.h>
+
+/* The framebuffer mapping is uncached device memory: plain memcpy stores
+ * 4 bytes at a time and every store goes to DDR. 16-byte NEON stores cut
+ * the number of bus transactions; rows are 2-byte pixels so handle the
+ * unaligned tail with a plain copy. */
+static void copy_row(uint8_t *dst, const uint8_t *src, size_t n)
+{
+    while (n >= 64) {
+        uint8x16_t a = vld1q_u8(src), b = vld1q_u8(src + 16), c = vld1q_u8(src + 32), d = vld1q_u8(src + 48);
+        vst1q_u8(dst, a); vst1q_u8(dst + 16, b); vst1q_u8(dst + 32, c); vst1q_u8(dst + 48, d);
+        src += 64; dst += 64; n -= 64;
+    }
+    while (n >= 16) { vst1q_u8(dst, vld1q_u8(src)); src += 16; dst += 16; n -= 16; }
+    if (n) memcpy(dst, src, n);
+}
 
 #define CTL_PHYS     0x23F00000UL
 #define FB_STRIDE_BUF 0x100000UL      /* 1 MB per buffer */
@@ -125,6 +141,7 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
     frames++;
     if (fb) {
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
+        long wait_before = wait_us_total;
         const uint8_t *src = data;
         if (have_ctl) {
             if (w > 2048 || h * w * 2 > FB_STRIDE_BUF) { w = w > 2048 ? 2048 : w; h = FB_STRIDE_BUF / (w * 2); }
@@ -145,7 +162,7 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
             int target = pending < 0 ? 0 : pending ^ 1;
             uint8_t *dst = fb + target * FB_STRIDE_BUF;
             for (unsigned y = 0; y < h; y++)
-                memcpy(dst + y * w * 2, src + y * pitch, w * 2);
+                copy_row(dst + y * w * 2, src + y * pitch, w * 2);
             if (w != cur_w || h != cur_h) {
                 ctl[CTL_WIDTH] = w; ctl[CTL_HEIGHT] = h; ctl[CTL_STRIDE] = w * 2;
                 cur_w = w; cur_h = h;
@@ -159,11 +176,11 @@ void video_present(const void *data, unsigned w, unsigned h, size_t pitch)
             unsigned ox = (fixed_w - cw) / 2, oy = (fixed_h - ch) / 2;
             uint16_t *dst = (uint16_t *)fb;
             for (unsigned y = 0; y < ch; y++)
-                memcpy(dst + (oy + y) * fixed_w + ox, src + y * pitch, cw * 2);
+                copy_row((uint8_t *)(dst + (oy + y) * fixed_w + ox), src + y * pitch, cw * 2);
         }
 done:
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000; copy_n++;
+        copy_us_total += (t1.tv_sec - t0.tv_sec) * 1000000L + (t1.tv_nsec - t0.tv_nsec) / 1000 - (wait_us_total - wait_before); copy_n++;
     }
     if (dump_every > 0 && dumpdir && frames % dump_every == 0)
         dump_ppm(data, w, h, pitch);

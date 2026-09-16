@@ -105,6 +105,11 @@ localparam CONF_STR = {
 	"-;",
 	"O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"-;",
+	// An SD-image slot: selecting a .dat here (or through an .mgl) makes Main
+	// mount the file, which costs nothing, and record its path in
+	// /tmp/FULLPATH for bennugd-launcherd. The core never reads the image.
+	"S0,DATDCB,Load game;",
+	"-;",
 	"J1,A,B,X,Y,L,R,Select,Start;",   // joystick word bits 4..11, read by the HPS through the control block
 	"jn,A,B,X,Y,L,R,Select,Start;",
 	"V,v",`BUILD_DATE

@@ -180,9 +180,32 @@ keeps the old one). The MiSTer's `/tmp` is a 246 MB tmpfs.
   fixed 2.5 ms of that (identical with and without O_SYNC). The core is
   built -O3 -mcpu=cortex_a9 -mfpu=neon. There is no cpufreq on this
   kernel, so 3s-mister-arm's sysfs overclock does not apply here.
-  Remaining levers, untested: `-flto` across bgdrtm (the VM loop calls
-  many small functions), a small read cache in the core's filesystem
-  layer for the sound loads, NEON for the translucent spans. The
+  `-flto` was tried and dropped: the binary dies silently right after
+  `retro_init` (libco or something else miscompiled under LTO; not worth
+  chasing). The sound-load hitches are cold SD reads out of the 320 MB
+  .dat (the core's filesystem layer caches names once, it does not scan
+  per open), so the frontend now pre-reads the game file into the page
+  cache from a nice-19 child after start; the MiSTer has ~450 MB free.
+- **The user's heavy level, profiled (00:00-00:15):** 44 % of frames over
+  budget there, interpreter median 16.6 ms. Split: instance_go 28 %,
+  draw_span_16to16_translucent 15 % (scaled/rotated translucent sprites,
+  table-based blend `ghost1[tex] + ghost2[dst]`, two 128 KB tables per
+  pixel), my uncached framebuffer copy 12 %, gr_unlock_screen 7 %, the
+  other 16-bit spans about 10 %.
+  - gr_unlock_screen: SorR sets `scale_resolution` to its own 416x240, so
+    BennuGD gathered the frame pixel by pixel through identity tables
+    every frame. `hps/patches/0002` adds a row-copy fast path for the
+    equal-size unrotated case. Median in the level after it: 4.6-4.9 ms,
+    over-budget frames 3.8 % (was 44 %; some of the difference is where
+    in the level the samples fell, but the unlock cost is gone).
+  - The framebuffer copy stays at 2.5 ms with NEON 16-byte stores too: the
+    uncached mapping is bus-bound, not instruction-bound. Left as is.
+  - Audio: the buffer is primed with silence at start and after every
+    underrun, and `audio.c` nudges one frame per flush to hold the queued
+    level near the primed level (`level` in the stats). Needed because
+    with vsync the game produces audio exactly as fast as it is consumed.
+  Remaining levers: the translucent span blend (arithmetic instead of the
+  two tables, NEON where the fetch is linear), and the interpreter loop. The
   in-process sampler (`prof=<file>` plus `tools/profsym.py`) makes each
   experiment a three-minute measurement on the real hardware.
 
@@ -195,6 +218,31 @@ outputs zero with AUDIO_S=1, DDRAM idle. Verilator lint (5.050) is clean
 with stubs for pll and hps_io. `BennuGD.qsf` is Template.qsf plus
 MISTER_FB=1, Lite edition, and the build_id pre-flow script; deviations are
 listed at the top of the file.
+
+## Game selection (Phase 6, 2026-09-15 evening)
+
+Main_MiSTer's own menu does the picking. `_Other/_BennuGD/` (the core
+browser only lists folders whose name starts with `_`) holds the rbf
+and one `.mgl` per game (`<rbf>_Other/_BennuGD/BennuGD</rbf>` resolves to
+the newest `BennuGD_*.rbf` there; `<file type="s" index="0" path=...>`
+mounts the .dat in the core's `S0` slot, which moves no data, unlike an
+`F` slot that would push 320 MB over SPI). With `log_file_entry=1` in the
+`[BennuGD]` ini section Main writes the selected path to `/tmp/FULLPATH`;
+the daemon accepts it when it is newer than `/tmp/CORENAME` and under the
+games folder, and restarts the frontend when it changes (the OSD's "Load
+game" switches games). Loading the bare rbf falls back to `game=` in
+bennugd.cfg. Relative `.mgl` paths are under `games/BennuGD/`.
+
+Two traps met on the way: Main records the path relative to the games
+folder (`BennuGD/SORRv52/SorR.dat`), so the daemon resolves it against
+the games folder and the card root; and busybox `pidof -x` does not see
+shell scripts, so an installer that "restarted" the daemon left the old
+ones running and each kept launching a frontend. The daemon now kills
+any other instance at start and every stray frontend before launching,
+keys restarts on the resolved game path only, and logs to
+`/media/fat/bennugd/launcherd.log`. Verified: `load_core` of the .mgl
+from the menu gives exactly one daemon and one frontend on the selected
+game.
 
 ## Numbers
 

@@ -30,6 +30,7 @@ int      audio_init(const char *dev, unsigned in_rate);
 void     audio_push(const int16_t *lr, size_t frames);
 void     audio_flush(void);
 unsigned audio_errors(void);
+long     audio_level_ms(void);   /* queued audio at the last flush, -1 unknown */
 bool     audio_active(void);   /* true: blocking writes pace the game, skip the frame timer */
 void     audio_close(void);
 

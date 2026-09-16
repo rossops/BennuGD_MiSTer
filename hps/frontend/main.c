@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -187,6 +188,28 @@ static long rss_kb(void)
     return pages * (sysconf(_SC_PAGESIZE) / 1024);
 }
 
+/* Pull the game file into the page cache from a low-priority child, so
+ * the sound effects BennuGD games load mid-level come from RAM instead of
+ * the SD card (each cold read was a visible hitch). The kernel drops the
+ * pages again if memory gets tight. */
+static void prewarm_file(const char *path)
+{
+    signal(SIGCHLD, SIG_IGN);      /* the child is reaped by the kernel, no zombie */
+    if (fork() != 0) return;
+    setpriority(PRIO_PROCESS, 0, 19);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        /* throttled to ~4 MB/s: an unthrottled read of the whole file starved
+         * the game of memory bandwidth for its first minute (16 ms frames in
+         * the intro, audio queue near empty) */
+        static char buf[256 << 10];
+        struct timespec nap = { 0, 60 * 1000000L };
+        while (read(fd, buf, sizeof buf) > 0) nanosleep(&nap, NULL);
+        close(fd);
+    }
+    _exit(0);
+}
+
 static int cmp_long(const void *a, const void *b)
 {
     long x = *(const long *)a, y = *(const long *)b;
@@ -248,6 +271,10 @@ int main(int argc, char **argv)
     {
         SDL_Surface *vs = SDL_GetVideoSurface();
         const SDL_VideoInfo *vi = SDL_GetVideoInfo();
+        extern SDL_Surface *screen, *scale_screen; extern int scale_resolution;   /* BennuGD libvideo globals */
+        if (scale_resolution != -1 && screen && scale_screen)
+            host_log("sdl: BennuGD draws %dx%d and scales to %dx%d every frame (scale_resolution=%d)",
+                     screen->w, screen->h, scale_screen->w, scale_screen->h, scale_resolution);
         if (vs && vi) host_log("sdl: surface %dx%d %d bpp masks %04x/%04x/%04x, native %d bpp%s",
                                vs->w, vs->h, vs->format->BitsPerPixel, vs->format->Rmask, vs->format->Gmask,
                                vs->format->Bmask, vi->vfmt->BitsPerPixel,
@@ -267,6 +294,7 @@ int main(int argc, char **argv)
     audio_init(opt.audio, arate);
     input_init(!core_mode);   /* beside Main_MiSTer, leave the devices shared so its OSD keeps working */
 
+    prewarm_file(opt.game);
     if (opt.prof) prof_start(opt.prof);
     long times[STAT_N], runs[STAT_N]; int nt = 0; long worst = 0;
     struct timespec next; clock_gettime(CLOCK_MONOTONIC, &next);
@@ -287,9 +315,9 @@ int main(int argc, char **argv)
         if (nt == STAT_N) {
             qsort(times, STAT_N, sizeof *times, cmp_long);
             qsort(runs, STAT_N, sizeof *runs, cmp_long);
-            host_log("stats: frame %ld run p50 %ld p99 %ld max %ld us | frame+audio p50 %ld p99 %ld us | fbcopy %ld us dropped %u | rss %ld kB audio_err %u",
+            host_log("stats: frame %ld run p50 %ld p99 %ld max %ld us | frame+audio p50 %ld p99 %ld us | fbcopy %ld us dropped %u | rss %ld kB audio_err %u level %ld ms",
                      frame, runs[STAT_N / 2], runs[STAT_N * 99 / 100], worst,
-                     times[STAT_N / 2], times[STAT_N * 99 / 100], video_copy_us(), video_dropped(), rss_kb(), audio_errors());
+                     times[STAT_N / 2], times[STAT_N * 99 / 100], video_copy_us(), video_dropped(), rss_kb(), audio_errors(), audio_level_ms());
             nt = 0; worst = 0;
         }
         if (audio_active()) continue;   /* the full ALSA buffer is the clock; video never blocks */
