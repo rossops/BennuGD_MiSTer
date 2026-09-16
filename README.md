@@ -57,7 +57,7 @@ BORDERLESS_SYNC
 This is the mode that renders at the game's native size. The others make
 the game upscale in software, which the ARM cannot afford.
 
-**3. Unpack the release.** Download `BennuGD_MiSTer_alpha_<date>.zip` from
+**3. Unpack the release.** Download `BennuGD_MiSTer_alpha_<date>.zip (the newest one)` from
 the Releases page and unzip it onto the root of the SD card. It creates:
 
 ```
