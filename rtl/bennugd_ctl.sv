@@ -1,8 +1,9 @@
 //============================================================================
-//  BennuGD control block: the link between the HPS frontend and the FPGA.
+//  BennuGD control block and framebuffer reader: the link between the HPS
+//  frontend and the FPGA, and the only master on the framework's DDRAM port.
 //
 //  A 64-byte block in DDR3 (CTL_ADDR) that both sides can reach: the HPS
-//  through /dev/mem, this module through the framework's DDRAM port.
+//  through /dev/mem, this module through the DDRAM port.
 //  Once per vertical blank it
 //    1. reads what the HPS asked for: which of the two framebuffers to
 //       show and their geometry,
@@ -10,6 +11,9 @@
 //       flip without hps_io or SPI on the Linux side) and the four
 //       joystick words Main_MiSTer feeds hps_io, so pads mapped in the OSD
 //       reach the game even though Main holds the evdev devices grabbed.
+//  Once per output line, on request from bennugd_video, it reads one row
+//  of the shown RGB565 buffer into the video module's line buffer
+//  (fb_width / 4 beats of 64 bits, one burst).
 //
 //  Layout, 32-bit words, byte offsets:
 //    0 present   HPS -> FPGA  0 shows FB0_ADDR, 1 shows FB1_ADDR
@@ -40,6 +44,15 @@ module bennugd_ctl
 	output reg [11:0] fb_height,
 	output reg [13:0] fb_stride,
 
+	// line fetch: bennugd_video asks for row line_y into half line_buf of
+	// its line buffer; the beats come back on line_we/line_waddr/line_wdata
+	input             line_req,
+	input      [11:0] line_y,
+	input             line_buf,
+	output reg        line_we,
+	output reg  [8:0] line_waddr,   // {buffer half, beat}
+	output reg [63:0] line_wdata,
+
 	output reg        ddr_rd,
 	output reg        ddr_we,
 	output reg  [7:0] ddr_burst,
@@ -54,27 +67,38 @@ module bennugd_ctl
 localparam [28:0] CTL_W = CTL_ADDR[31:3];
 
 reg [31:0] vcount;
-reg  [2:0] state;
+reg  [3:0] state;
 reg        beat;
-reg        vs_d;
+reg        vs_d, vs_pend;
+reg        req_pend, req_buf;
+reg [22:0] req_off;    // y * stride/8, multiplied when the request arrives
+reg  [7:0] beats, bcnt;
+
+// row address in 64-bit words: base/8 + y * stride/8
+wire [28:0] row_addr = fb_base[31:3] + req_off;
+// beats per row: width / 4 pixels, one burst (the port takes up to 255)
+wire [7:0]  row_beats = (fb_width[11:10] != 0) ? 8'd255 : fb_width[9:2];
 
 always @(posedge clk) begin
 	vs_d <= vs;
 
 	if (reset) begin
-		state     <= 0;
-		ddr_rd    <= 0;
-		ddr_we    <= 0;
-		ddr_burst <= 1;
-		ddr_be    <= 8'hFF;
-		ddr_addr  <= CTL_W;
-		ddr_din   <= 0;
-		fb_base   <= FB0_ADDR;
-		fb_width  <= 12'd416;
-		fb_height <= 12'd240;
-		fb_stride <= 14'd832;
-		vcount    <= 0;
-		beat      <= 0;
+		state      <= 0;
+		ddr_rd     <= 0;
+		ddr_we     <= 0;
+		ddr_burst  <= 1;
+		ddr_be     <= 8'hFF;
+		ddr_addr   <= CTL_W;
+		ddr_din    <= 0;
+		fb_base    <= FB0_ADDR;
+		fb_width   <= 12'd416;
+		fb_height  <= 12'd240;
+		fb_stride  <= 14'd832;
+		vcount     <= 0;
+		beat       <= 0;
+		vs_pend    <= 0;
+		req_pend   <= 0;
+		line_we    <= 0;
 	end
 	else begin
 		// a request is held until the port stops being busy, then dropped
@@ -83,11 +107,33 @@ always @(posedge clk) begin
 			ddr_we <= 0;
 		end
 
+		// remember what arrived while the port was busy with the other job
+		if (vs & ~vs_d) vs_pend <= 1;
+		if (line_req) begin
+			req_pend <= 1;
+			req_off  <= line_y * fb_stride[13:3];
+			req_buf  <= line_buf;
+		end
+
+		line_we <= 0;
+
 		case (state)
-		// wait for the vertical sync
-		0: if (vs & ~vs_d) begin
-				vcount <= vcount + 1'd1;
-				state  <= 1;
+		// idle: a row fetch first (it has a deadline), the block at vblank
+		0: if (req_pend) begin
+				if (!ddr_busy) begin
+					ddr_rd    <= 1;
+					ddr_burst <= row_beats;
+					ddr_addr  <= row_addr;
+					beats     <= row_beats;
+					bcnt      <= 0;
+					req_pend  <= 0;
+					state     <= 6;
+				end
+			end
+			else if (vs_pend) begin
+				vcount  <= vcount + 1'd1;
+				vs_pend <= 0;
+				state   <= 1;
 			end
 
 		// read the two 64-bit words the HPS writes (present/width, height/stride)
@@ -133,6 +179,15 @@ always @(posedge clk) begin
 				ddr_addr  <= CTL_W + 29'd6;
 				ddr_din   <= {32'd0, joy3};
 				state     <= 0;
+			end
+
+		// one row of pixels streaming into the line buffer
+		6: if (ddr_dout_ready) begin
+				line_we    <= 1;
+				line_waddr <= {req_buf, bcnt};
+				line_wdata <= ddr_dout;
+				bcnt       <= bcnt + 1'd1;
+				if (bcnt == beats - 1'd1) state <= 0;
 			end
 
 		default: state <= 0;

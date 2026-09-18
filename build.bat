@@ -1,5 +1,8 @@
 @echo off
 setlocal
+rem cmd.exe cannot use a UNC path (\\server\share\...) as its working directory and
+rem silently falls back to C:\Windows; pushd maps a temporary drive letter for it.
+pushd "%~dp0"
 rem BennuGD for MiSTer - Quartus Prime 17.0 Lite command-line build.
 rem Usage: build.bat            (full compile, copies dated .rbf to releases\)
 if "%QUARTUS_ROOTDIR%"=="" set QUARTUS_ROOTDIR=C:\intelFPGA_lite\17.0\quartus
@@ -13,6 +16,7 @@ if errorlevel 1 (
     for %%f in (output_files\%PROJECT%.map.rpt output_files\%PROJECT%.fit.rpt) do (
         if exist %%f findstr /i /c:"Error" %%f
     )
+    popd
     exit /b 1
 )
 
@@ -28,6 +32,7 @@ if not exist releases mkdir releases
 copy /y output_files\%PROJECT%.rbf releases\%PROJECT%_%STAMP%.rbf
 if errorlevel 1 (
     echo COPY FAILED - the .rbf is still at output_files\%PROJECT%.rbf
+    popd
     exit /b 1
 )
 echo.
@@ -39,3 +44,4 @@ findstr /r /c:"^; M10K blocks" output_files\%PROJECT%.fit.rpt
 echo.
 echo Done: releases\%PROJECT%_%STAMP%.rbf
 endlocal
+popd

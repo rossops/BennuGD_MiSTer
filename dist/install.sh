@@ -25,12 +25,12 @@ for r in "$HERE"/BennuGD_*.rbf; do [ -f "$r" ] && mv "$r" "$CORES/"; done
 INI=/media/fat/MiSTer.ini
 sed -i '/^\[BennuGD\]$/,/^main=bennugd\/bennugd$/d' "$INI"    # the abandoned main= handoff
 if ! grep -q '^\[BennuGD\]' "$INI"; then
-    printf '\n[BennuGD]\nlog_file_entry=1\ndirect_video=0\n' >> "$INI"
+    printf '\n[BennuGD]\nlog_file_entry=1\n' >> "$INI"
     # log_file_entry: Main records the chosen game in /tmp/FULLPATH
-    # direct_video=0: the picture only exists in the scaler's framebuffer;
-    # direct video bypasses the scaler and shows this core's own RGB, which is black
-elif ! sed -n '/^\[BennuGD\]/,/^\[/p' "$INI" | grep -q '^direct_video='; then
-    sed -i '/^\[BennuGD\]/a direct_video=0' "$INI"
+else
+    # earlier installers forced direct_video=0 here because the core had no
+    # video of its own; it has now, so the global setting applies again
+    sed -i '/^\[BennuGD\]/,/^\[/{/^direct_video=0$/d}' "$INI"
 fi
 US=/media/fat/linux/user-startup.sh
 [ -f "$US" ] || printf '#!/bin/sh\n' > "$US"

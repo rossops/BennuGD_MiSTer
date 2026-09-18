@@ -120,13 +120,18 @@ int video_init(unsigned long fb_phys, unsigned w, unsigned h, const char *dir, i
         }
     }
     if (have_ctl) {
-        /* rough vblank rate, for the log and for the audio clock */
-        uint32_t v = ctl[CTL_VBLANK];
+        /* vblank rate for the log and, above all, the audio clock (735 samples
+         * per vblank). Start the clock on a counter edge: counting from a
+         * random phase made 30 edges span 29-30 periods, which read up to 3 %
+         * high and varied between launches; the game then outran the display
+         * and dropped frames while audio underran (GitHub report, 2026-09-18).
+         * 60 edges from an edge: better than 0.1 %. */
+        uint32_t v = wait_vblank_change(ctl[CTL_VBLANK], 50000);
         struct timespec t0, t1; clock_gettime(CLOCK_MONOTONIC, &t0);
-        for (int i = 0; i < 30; i++) v = wait_vblank_change(v, 50000);
+        for (int i = 0; i < 60; i++) v = wait_vblank_change(v, 50000);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double s = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
-        vblank_hz = 30.0 / s;
+        vblank_hz = 60.0 / s;
         host_log("video: control block found, two buffers at 0x%lx, vblank %.2f Hz", fb_phys, vblank_hz);
         copier_run = true;
         pin_to_cpu(0);

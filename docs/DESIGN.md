@@ -400,3 +400,69 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   PPM dump (`dump_dir=` / `dump_every=`) captures the staged frame so the
   overlay can be checked from a dump; reading the DDR buffer back through
   `/dev/mem` with dd returns 0 bytes on this kernel.
+
+## 2026-09-18: native 240p video (rtl/bennugd_video.sv)
+
+- **Why.** With MISTER_FB the picture only existed inside the scaler: the
+  core's own VGA outputs were black, so `direct_video=1` (issue #1) and
+  the analog board showed nothing. Now the FPGA reads the RGB565 frame
+  back out of DDR3 a row ahead of the beam and drives VGA_R/G/B/HS/VS/DE
+  with a 240p timing. HDMI goes through the scaler like every other core
+  (FB_EN is off; an OSD switch "HDMI picture: HPS framebuffer" turns the
+  old path back on as a fallback), analog and direct_video get the same
+  timing directly. No HPS change: the control block already carries
+  width/height/stride/present and the vblank counter keeps its meaning.
+- **Timing.** CLK_VIDEO and DDRAM_CLK are now the 100 MHz PLL output. A
+  line is 6360 cycles (63.6 us, 15.72 kHz), a frame 262 lines (60.0 Hz;
+  was 59.84 with the Menu timing, so the audio rate the frontend derives
+  from the measured vblank moves with it). HSync is the first 470 cycles,
+  VSync lines 245-247, rows 0-239 carry the picture. The pixel clock is
+  CE_PIXEL every `div` cycles with `div` from a ladder on the frame width
+  (<=256: 20, <=320: 16, <=352: 14, <=416: 12, <=512: 10, <=640: 8,
+  <=832: 6, else 4), so the active area is always about 50 us wide: a
+  4:3 game fills a 4:3 CRT, SorR's 416 px does too (squeezed, as on any
+  4:3 set; the OSD aspect option still governs the scaler). The active
+  window is centred in the nominal 51.7 us visible span; frames shorter
+  than 240 rows are centred vertically; taller ones (SorR's 832x480
+  modes) show every other row. With hps_io's forced_scandoubler every
+  horizontal figure halves, the frame has 524 lines and each row is shown
+  twice (the Menu core's approach); the ladder uses even dividers so the
+  halves stay integers.
+- **Rows.** At the start of each output line bennugd_video asks
+  bennugd_ctl for the next line's row into the other half of a two-row
+  line buffer; bennugd_ctl (still the only DDRAM master) reads width/4
+  beats in one burst (208 beats for 832 px, well inside the 10 us before
+  the active area) and queues the vblank control-block traffic behind
+  any fetch. The buffer is four 16-bit banks written 64 bits at a time, so
+  each pixel is one read of the bank its x selects; the address is
+  always the word of the pixel after the one starting at the current
+  CE, which keeps the pipeline right down to 2 cycles per pixel.
+  Bandwidth: 13 MB/s progressive, 26 scandoubled.
+- **Verification.** `tools/sim.sh` runs `rtl/tb/tb_video.sv` under
+  iverilog against a DDRAM model whose pixel (x, y) is {y, x}: every
+  active pixel of frames 3 and 4 is compared, plus the active size and
+  the line/frame periods, for 416x240, 320x200, 832x480 and 416x240
+  scandoubled (about 80 s). Geometry from the control block takes two
+  frames to reach the display (latched at the top of vblank, read at
+  vsync), so a mode change has one wrong frame; harmless. verilator lint
+  of `emu` is clean for our files (remaining messages are hps_io's PS/2
+  registers under an ifdef, which Quartus accepts).
+- **On the hardware (18:40).** First Quartus build failed timing on the
+  x0 path (width ladder + multiply + centre in one cycle, -2.3 ns at
+  100 MHz); pipelined into three registers, and the row-address multiply
+  moved to request time. The first rbf was tried anyway: the frontend
+  found the control block at 60 Hz and the user reported the HDMI picture
+  through the scaler "looks really good". Also fixed on the way: build.bat
+  ran Quartus in C:\Windows when launched from the UNC path (cmd.exe
+  cannot cd to \\server\share), now pushd's its own directory. The
+  installer no longer forces direct_video=0 and removes the line it once
+  added.
+- **Vblank rate measured wrong (19:00, from the issue #1 follow-up).** The
+  reporter's logs showed the vblank at 60.4-61.1 Hz on a 59.83 Hz timing,
+  different on every launch, the audio opened at 735x that, the game
+  outran the display (5 % dropped frames) and audio underran. video.c
+  started its clock at a random phase, so 30 counted edges spanned 29-30
+  periods: up to 3 % high. Now the clock starts on an edge and counts 60
+  of them; three starts read 60.00/60.02/60.03 Hz on the new core, where
+  the old code read 60.24 and 60.32.
+

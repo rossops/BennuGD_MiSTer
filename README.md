@@ -24,11 +24,11 @@ All captures are from the MiSTer over HDMI, through a capture card.
 ## Installing Streets of Rage Remake 5.2
 
 You need a MiSTer updated during 2026 (the launch mechanism relies on a
-Main_MiSTer from this year), a display on the HDMI port (the picture goes
-through the MiSTer scaler; analog output is not supported yet), a way to
-put files on the SD card (the network share or a card reader), and your
-own copy of Streets of Rage Remake 5.2. Nothing from the game ships with
-this core.
+Main_MiSTer from this year), a display on HDMI or on the analog output
+(the core produces a normal 240p picture, so the scaler, `direct_video`
+and the analog board all work), a way to put files on the SD card (the
+network share or a card reader), and your own copy of Streets of Rage
+Remake 5.2. Nothing from the game ships with this core.
 
 **1. Get the game onto the card.** On a PC, SorR 5.2 is a folder with
 `SorR.exe`, `SorR.dat`, `mod`, `palettes` and `savegame` in it. Create
@@ -116,14 +116,13 @@ BennuGD_install once (step 4). The game itself is never part of it.
 
 ## If something is wrong
 
-**Black picture over HDMI, sound playing.** Your MiSTer.ini has
-`direct_video=1` (used with HDMI-to-VGA DACs). Direct video bypasses the
-scaler, and this core's picture lives in the scaler's framebuffer; its
-own RGB output is black. The installer writes `direct_video=0` into the
-`[BennuGD]` section of MiSTer.ini so the setting is overridden for this
-core only; if you installed before that was added, add the line yourself
-under `[BennuGD]`. Analog output through a DAC is not possible with this
-core yet.
+**Black picture over HDMI, sound playing.** Cores before
+`BennuGD_20260918.rbf` had no picture of their own, so `direct_video=1`
+(HDMI-to-VGA DACs) showed black. Update the core; with the current one
+the picture is a normal 240p signal and direct video, the analog board
+and the scaler all show it. Should the native picture ever misbehave, the
+OSD option "HDMI picture: HPS framebuffer" switches HDMI back to the old
+path where the scaler reads the frame from memory itself.
 
 **Choppy sound, game running slowly.** First check the game's display
 mode: look in `/media/fat/bennugd/bennugd.log` for a line `env: av info`.
@@ -155,13 +154,13 @@ MiSTer menu: Other -> BennuGD -> SoRR 5.2 (.mgl)
    path; a small daemon on the Linux side sees the core name and starts
    /media/fat/bennugd/bennugd on that game.
 
-ARM (Linux)                                    FPGA (Template_MiSTer + MISTER_FB)
-bennugd: a tiny libretro host around           scans two RGB565 buffers in DDR3,
-BennuGD_libretro, statically linked            flips them at vblank through a
-  video  -> DDR3 via /dev/mem, page flip        64-byte control block that also
-  audio  -> ALSA default (alsa.sv in the FPGA)  carries the OSD-mapped pads
-  input  <- hps_io joystick words (control      to Linux; alsa.sv takes the
-            block) or evdev when run from ssh   HPS audio; Menu-core timing
+ARM (Linux)                                    FPGA (Template_MiSTer)
+bennugd: a tiny libretro host around           reads the RGB565 frame back from
+BennuGD_libretro, statically linked            DDR3 a row ahead of the beam and
+  video  -> DDR3 via /dev/mem, page flip        outputs it as 240p / 15.7 kHz
+  audio  -> ALSA default (alsa.sv in the FPGA)  video; a 64-byte control block
+  input  <- hps_io joystick words (control      flips buffers at vblank and
+            block) or evdev when run from ssh   carries the OSD-mapped pads
 ```
 
 `docs/DESIGN.md` has the verified facts, the measurements and the dead

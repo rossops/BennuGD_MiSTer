@@ -3,14 +3,15 @@
 //  BennuGD for MiSTer: the FPGA half of a Linux/ARM game runtime.
 //
 //  The HPS runs the BennuGD interpreter (see hps/) and writes RGB565 frames
-//  into DDR3 at FB_BASE. This module only tells the framework's scaler where
-//  that buffer is (MISTER_FB) and supplies a video timing for it to follow.
+//  into DDR3. rtl/bennugd_video.sv reads them back a row ahead of the beam
+//  and drives the core's video outputs with a 240p / 15.7 kHz timing, so the
+//  picture reaches HDMI through the scaler like any other core's, the analog
+//  outputs directly, and direct_video works. The scaler-framebuffer path
+//  (MISTER_FB) is kept behind an OSD switch as a fallback for HDMI.
 //  Audio reaches the DAC/HDMI through the framework's alsa.sv from
 //  /dev/MrAudio, so the core's own audio outputs stay silent. Controllers
-//  are read by the HPS over evdev.
-//
-//  The timing is the Menu core's NTSC timing: 20 MHz CLK_VIDEO, 10 MHz
-//  pixels, 638 x 262, about 59.8 Hz. That is the scaler's best-tested input.
+//  come through hps_io's joystick words, handed to the HPS in the control
+//  block (rtl/bennugd_ctl.sv).
 //
 //  This program is free software; you can redistribute it and/or modify it
 //  under the terms of the GNU General Public License as published by the Free
@@ -55,7 +56,9 @@ assign BUTTONS = 0;
 // Two RGB565 buffers at 0x22000000 and 0x22100000 (above ascal's own buffers
 // at 0x20000000), a 64-byte control block at 0x23F00000. The HPS picks the
 // buffer and the geometry through the block; defaults are SorR's 416x240.
-assign FB_EN          = 1;
+// FB_EN makes the scaler show that buffer directly instead of the core's
+// video (HDMI only); off by default, see the OSD option.
+assign FB_EN          = status[3];
 assign FB_FORMAT      = 5'b10100;       // 16bpp 565 with bit 4 (BGR) set: this is how RGB565 in memory
                                         // comes out with red as red (bit 4 clear swapped R and B on screen)
 assign FB_FORCE_BLANK = 0;
@@ -69,17 +72,30 @@ always @(posedge CLK_VIDEO) begin
 	joy0_v <= joystick_0; joy1_v <= joystick_1; joy2_v <= joystick_2; joy3_v <= joystick_3;
 end
 
+wire        line_req, line_buf, line_we;
+wire [11:0] line_y;
+wire  [8:0] line_waddr;
+wire [63:0] line_wdata;
+wire        hs, vs, hblank, vblank;   // from bennugd_video below
+
 bennugd_ctl ctl
 (
 	.clk(CLK_VIDEO),
 	.reset(RESET),
-	.vs(VSync),
+	.vs(vs),                // the control block counts vertical syncs
 	.joy0(joy0_v), .joy1(joy1_v), .joy2(joy2_v), .joy3(joy3_v),
 
 	.fb_base(FB_BASE),
 	.fb_width(FB_WIDTH),
 	.fb_height(FB_HEIGHT),
 	.fb_stride(FB_STRIDE),
+
+	.line_req(line_req),
+	.line_y(line_y),
+	.line_buf(line_buf),
+	.line_we(line_we),
+	.line_waddr(line_waddr),
+	.line_wdata(line_wdata),
 
 	.ddr_rd(DDRAM_RD),
 	.ddr_we(DDRAM_WE),
@@ -112,6 +128,8 @@ localparam CONF_STR = {
 	"-;",
 	"J1,A,B,X,Y,L,R,Select,Start;",   // joystick word bits 4..11, read by the HPS through the control block
 	"jn,A,B,X,Y,L,R,Select,Start;",
+	"-;",
+	"O[3],HDMI picture,Core video,HPS framebuffer;",   // fallback: the scaler reads DDR3 itself
 	"V,v",`BUILD_DATE
 };
 
@@ -144,51 +162,38 @@ pll pll
 	.refclk(CLK_50M),
 	.rst(0),
 	.outclk_0(clk_sys),     // 100 MHz
-	.outclk_1(CLK_VIDEO)    // 20 MHz
+	.outclk_1()             // 20 MHz, unused
+);
+assign CLK_VIDEO = clk_sys;
+
+///////// Native video: the framebuffer read back as 240p / 15.7 kHz /////////
+
+bennugd_video video
+(
+	.clk(CLK_VIDEO),
+	.reset(RESET),
+	.scandouble(forced_scandoubler),
+	.fb_width(FB_WIDTH),
+	.fb_height(FB_HEIGHT),
+	.line_req(line_req),
+	.line_y(line_y),
+	.line_buf(line_buf),
+	.line_we(line_we),
+	.line_waddr(line_waddr),
+	.line_wdata(line_wdata),
+	.ce_pix(CE_PIXEL),
+	.hs(hs),
+	.vs(vs),
+	.hblank(hblank),
+	.vblank(vblank),
+	.r(VGA_R),
+	.g(VGA_G),
+	.b(VGA_B)
 );
 
-///////// Video timing (Menu core, NTSC) /////////
-
-reg [9:0] hc, vc;
-reg ce_pix;
-reg HBlank, HSync, VBlank, VSync;
-
-always @(posedge CLK_VIDEO) begin
-	if(forced_scandoubler) ce_pix <= 1;
-		else ce_pix <= ~ce_pix;
-
-	if(ce_pix) begin
-		if(hc == 637) begin
-			hc <= 0;
-			if(vc == (forced_scandoubler ? 523 : 261)) vc <= 0;
-				else vc <= vc + 1'd1;
-		end else begin
-			hc <= hc + 1'd1;
-		end
-	end
-end
-
-always @(posedge CLK_VIDEO) begin
-	if (hc == 529) HBlank <= 1;
-		else if (hc == 0) HBlank <= 0;
-
-	if (hc == 544) begin
-		HSync <= 1;
-		if(vc == (forced_scandoubler ? 490 : 245)) VSync <= 1;
-			else if (vc == (forced_scandoubler ? 496 : 248)) VSync <= 0;
-		if(vc == (forced_scandoubler ? 480 : 240)) VBlank <= 1;
-			else if (vc == 0) VBlank <= 0;
-	end
-	if (hc == 590) HSync <= 0;
-end
-
-assign CE_PIXEL = ce_pix;
-assign VGA_DE = ~(HBlank | VBlank);
-assign VGA_HS = HSync;
-assign VGA_VS = VSync;
-assign VGA_R  = 0;   // the picture comes from the framebuffer via the scaler
-assign VGA_G  = 0;
-assign VGA_B  = 0;
+assign VGA_HS = hs;
+assign VGA_VS = vs;
+assign VGA_DE = ~(hblank | vblank);
 
 ///////// Heartbeat /////////
 
