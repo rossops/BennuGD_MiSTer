@@ -221,6 +221,7 @@ static long rss_kb(void)
 static void prewarm_file(const char *path, int mbps)
 {
     if (mbps == 0) return;
+    if (mbps > 1024) mbps = 1024;   /* above the storage's speed it is unthrottled anyway; keeps the arithmetic in range */
     if (mbps < 0) {
         /* filesystem type of the longest mount point containing the path */
         char fstype[32] = "?";

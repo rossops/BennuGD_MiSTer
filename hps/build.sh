@@ -18,9 +18,28 @@ for p in "$HERE"/patches/*.patch; do
     fi
     git -C "$HERE/BennuGD_libretro" apply "$p" && echo "applied $(basename "$p")"
 done
+# Profile-guided optimisation (docs/DESIGN.md, 2026-09-19):
+#   PGO=gen            instrumented binary; run it on the device with
+#                      LLVM_PROFILE_FILE=/media/fat/bennugd/bennugd.profraw and
+#                      let it exit normally (the game's exit chord or SIGTERM)
+#   PGO=use FILE       optimise with the merged profile (llvm-profdata merge)
+# Each mode gets its own build tree so the flags cannot leak into a normal build.
+#   (default)          use hps/pgo/bennugd.profdata when it exists (PGO=off to skip)
+PGO_FLAGS=
+if [ -z "${PGO:-}" ] && [ -f "$HERE/pgo/bennugd.profdata" ]; then
+    PGO=use; PGO_PROFILE="$HERE/pgo/bennugd.profdata"
+fi
+case "${PGO:-}" in
+    gen) PGO_FLAGS="-fprofile-instr-generate"; BUILD_DIR="$BUILD_DIR-pgo-gen"; PGO_CMAKE="-DPGO_GEN=ON" ;;
+    use) [ -f "${PGO_PROFILE:?PGO=use needs PGO_PROFILE=<file.profdata>}" ] || exit 2
+         PGO_FLAGS="-fprofile-instr-use=$PGO_PROFILE -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date"
+         [ "${PGO_PROFILE}" = "$HERE/pgo/bennugd.profdata" ] || BUILD_DIR="$BUILD_DIR-pgo-use" ;;
+esac
+# through the environment: -DCMAKE_C_FLAGS would replace the toolchain's -target
+CFLAGS="${CFLAGS:-} $PGO_FLAGS" LDFLAGS="${LDFLAGS:-} $PGO_FLAGS" \
 cmake -B "$BUILD_DIR" -S "$HERE" \
     -DCMAKE_TOOLCHAIN_FILE="$HERE/cmake/zig.toolchain.arm-linux-gnueabihf-a9" \
-    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_BUILD_TYPE=Release ${PGO_CMAKE:-}
 cmake --build "$BUILD_DIR" -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
 mkdir -p "$HERE/out"
 cp "$BUILD_DIR/bennugd" "$HERE/out/bennugd"

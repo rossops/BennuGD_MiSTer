@@ -495,3 +495,60 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   drops per 600); at 416x240 on the fixed frontend they have ~0 drops and
   the heavy scenes sit at 15-17 ms per frame, i.e. the interpreter.
 
+## 2026-09-19: interpreter loop, round two (patch 0006)
+
+- **Benchmark.** Attract mode from the card's current save state turned
+  out to be repeatable when the frontend is restarted by the daemon from
+  the attract screen (no continue state): two runs of the same binary
+  matched within 0.5 % window by window. Two segments: frames 1200-6000
+  (a demo stage, "A") and 6600-11400 (the next, "B"); `run p50` averaged
+  over the windows. Loading the core from the menu instead resumes the
+  last played level and gives a different sequence, so always restart the
+  frontend, not the core, to measure.
+- **Stack pointer in a register.** `r->stack_ptr` was read and written
+  from memory on every push and pop (three memory operations per push,
+  a store-to-load round trip per opcode). instance_go now keeps it in a
+  local `sp` and writes it back before anything outside the loop can look
+  at it: instance_new/instance_duplicate (they copy the parent's stack),
+  the nested instance_go of a child (its exit path writes
+  `called_by->stack_ptr[-1]`), every system call/procedure, the sleep
+  `return 0`, and the break_all exit; the loop reloads it at its entry
+  label. Also hoisted: `r->locdata` for the status check and `r->stack`
+  for the underflow check. A: 6.57 -> 6.30 ms, B: 4.65 -> 4.46 ms.
+- **Check the exit flag and the status only when they can have changed.**
+  `must_exit` and the instance status are only written by system calls,
+  by a child process run from MN_CALL/MN_PROC, and by the return/frame
+  opcodes that leave the loop anyway, so the loop head now re-reads them
+  only after those opcodes (`check` flag). A: -> 5.97 ms, B: -> 4.24 ms.
+  Together about 9 % of the whole frame; p99 in A 15.0 -> 14.0 ms.
+- Left on the table: the switch dispatch itself (one shared indirect
+  branch), per-opcode `ptr` bookkeeping, and the opcode bodies. Profile-
+  guided optimisation builds and links with zig cc (`-fprofile-instr-
+  generate`), only `llvm-profdata` (Homebrew llvm@19) is missing on the
+  Mac to merge the profiles; direct-threaded dispatch would need every
+  `break` at the end of a case turned into a computed goto.
+- **Profile-guided optimisation (00:15).** zig cc compiles and links
+  `-fprofile-instr-generate`, but the binary only got the counter
+  sections: zig's own compiler-rt has no profile runtime, so nothing ever
+  wrote the .profraw (zig defines a dummy `__llvm_profile_runtime`, which
+  is also why a static library of the runtime was dropped by the linker).
+  LLVM 19.1.7's `compiler-rt/lib/profile` (17 C files plus two headers,
+  Apache-2.0 with LLVM exception) is vendored under `hps/pgo/profile/`
+  and compiled straight into `PGO=gen` builds together with
+  `pgo_runtime.c`, the C equivalent of InstrProfilingRuntime.cpp. The
+  flags go through the CFLAGS/LDFLAGS environment: `-DCMAKE_C_FLAGS` on
+  the cmake line replaced the toolchain's `-target` and the test compile
+  linked for macOS. Training: the instrumented binary (2x slower) run by
+  hand with `LLVM_PROFILE_FILE=... ./bennugd.pgo --core` through four
+  minutes of the same attract sequence, stopped with SIGTERM (a clean
+  exit, so the atexit writer runs), merged with Homebrew llvm@19's
+  `llvm-profdata` (5642 functions). `hps/pgo/bennugd.profdata` is
+  committed and `hps/build.sh` uses it whenever it exists (`PGO=off`
+  skips it); regenerate it after big changes to the interpreter or the
+  blitters, a stale profile is only ignored function by function.
+  Result on the same sequence: A 5.97 -> 5.77 ms, B 4.24 -> 4.10 ms, and
+  the binary shrinks from 8.6 to 8.2 MB. The three interpreter steps of
+  the day together: A 6.57 -> 5.77 ms, B 4.65 -> 4.10 ms (-12 %). The
+  training data is the benchmark sequence itself, so gameplay may gain a
+  little less.
+

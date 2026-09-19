@@ -49,6 +49,20 @@ add_executable(bennugd
     frontend/prof.c
 )
 target_include_directories(bennugd PRIVATE BennuGD_libretro/libretro BennuGD_libretro/libretro/sdl-libretro/include)
+
+# PGO=gen in build.sh: the LLVM profile runtime (see pgo/README.md)
+option(PGO_GEN "link the vendored LLVM profile runtime for an instrumented build" OFF)
+if(PGO_GEN)
+    # compiled into the executable itself: as a static library nothing would
+    # reference it (zig's compiler-rt already defines a dummy runtime symbol)
+    file(GLOB PGO_RT_SRC pgo/profile/*.c)
+    list(APPEND PGO_RT_SRC pgo/pgo_runtime.c)
+    set_source_files_properties(${PGO_RT_SRC} PROPERTIES
+        COMPILE_OPTIONS "-fno-profile-instr-generate;-w"
+        COMPILE_DEFINITIONS "COMPILER_RT_HAS_ATOMICS=1;COMPILER_RT_HAS_FCNTL_LCK=1;COMPILER_RT_HAS_UNAME=1"
+        INCLUDE_DIRECTORIES "${CMAKE_CURRENT_SOURCE_DIR}/pgo/profile")
+    target_sources(bennugd PRIVATE ${PGO_RT_SRC})
+endif()
 target_compile_options(bennugd PRIVATE -Wall -Wextra)
 set_target_properties(bennugd PROPERTIES POSITION_INDEPENDENT_CODE OFF)
 target_link_libraries(bennugd PRIVATE bennugd_libretro m pthread dl)

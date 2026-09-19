@@ -86,3 +86,4 @@ verif/unit/z80/*.txt
 # MAME writes its cfg here when run from the repo root (tools/*.lua sessions)
 cfg/
 hps/out
+*.profraw
