@@ -38,9 +38,10 @@ static struct {
     char *game, *log, *audio, *dump_dir, *prof;
     unsigned long fb;
     int dump_every, frames, menu, fps;
+    int preread;                    /* MB/s for the page-cache pre-read; -1 auto, 0 off */
     struct { char *key, *val; } vars[MAX_VARS];
     int nvars;
-} opt = { .audio = "default" };
+} opt = { .audio = "default", .preread = -1 };
 
 static FILE *logf;
 static struct retro_system_av_info av;
@@ -96,6 +97,7 @@ static int apply_setting(const char *key, const char *val)
     else if (!strcmp(key, "frames")) opt.frames = atoi(val);
     else if (!strcmp(key, "menu")) opt.menu = atoi(val);
     else if (!strcmp(key, "fps")) opt.fps = atoi(val);
+    else if (!strcmp(key, "preread")) opt.preread = atoi(val);
     else if (!strcmp(key, "prof")) opt.prof = strdup(val);
     else if (!strncmp(key, "opt.", 4)) set_var(key + 4, val);
     else return -1;
@@ -206,19 +208,49 @@ static long rss_kb(void)
  * the sound effects BennuGD games load mid-level come from RAM instead of
  * the SD card (each cold read was a visible hitch). The kernel drops the
  * pages again if memory gets tight. */
-static void prewarm_file(const char *path)
+/* Read the whole game file once into the page cache from a background
+ * child, so the game's own reads of sounds and levels during play never
+ * wait for the SD card or the network.
+ * Rate: an unthrottled read starved the game of memory bandwidth for its
+ * first minute (16 ms frames in the intro, audio queue near empty), so the
+ * default is 4 MB/s from local storage. On a network filesystem every read
+ * the game makes before the pre-read gets there costs a round trip and
+ * shows as a dropped frame, so there the default is 16 MB/s: the file is
+ * cached in 20 s instead of 80. preread=<MB/s> in bennugd.cfg overrides,
+ * 0 disables. */
+static void prewarm_file(const char *path, int mbps)
 {
+    if (mbps == 0) return;
+    if (mbps < 0) {
+        /* filesystem type of the longest mount point containing the path */
+        char fstype[32] = "?";
+        size_t best = 0;
+        FILE *m = fopen("/proc/mounts", "r");
+        if (m) {
+            char dev[256], mnt[256], type[32];
+            while (fscanf(m, "%255s %255s %31s %*[^\n]", dev, mnt, type) == 3) {
+                size_t n = strlen(mnt);
+                if (n >= best && strncmp(path, mnt, n) == 0 && (n == 1 || path[n] == '/' || path[n] == 0)) {
+                    best = n;
+                    strncpy(fstype, type, sizeof fstype - 1);
+                }
+            }
+            fclose(m);
+        }
+        int net = !strcmp(fstype, "cifs") || !strcmp(fstype, "smb3") || !strncmp(fstype, "nfs", 3) ||
+                  !strncmp(fstype, "fuse", 4);
+        mbps = net ? 16 : 4;
+        host_log("pre-read: %s storage (%s), %d MB/s", net ? "network" : "local", fstype, mbps);
+    }
     signal(SIGCHLD, SIG_IGN);      /* the child is reaped by the kernel, no zombie */
     if (fork() != 0) return;
     signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL);   /* the parent's handlers would make the child ignore a kill */
     setpriority(PRIO_PROCESS, 0, 19);
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
-        /* throttled to ~4 MB/s: an unthrottled read of the whole file starved
-         * the game of memory bandwidth for its first minute (16 ms frames in
-         * the intro, audio queue near empty) */
         static char buf[256 << 10];
-        struct timespec nap = { 0, 60 * 1000000L };
+        long ns = (long)(sizeof buf) * 1000000000L / ((long)mbps << 20);   /* per 256 KB chunk */
+        struct timespec nap = { ns / 1000000000L, ns % 1000000000L };
         while (read(fd, buf, sizeof buf) > 0) nanosleep(&nap, NULL);
         close(fd);
     }
@@ -236,7 +268,7 @@ static void usage(void)
     fprintf(stderr,
         "usage: bennugd <game.dat|--core> [key=value ...]\n"
         "  game= log= audio=(default|none|<alsa device>) fb=0x22000000|0 dump_dir= dump_every=N\n"
-        "  frames=N menu=0|1 prof=<dump file> fps=0|1 opt.<core option>=<value>\n");
+        "  frames=N menu=0|1 prof=<dump file> fps=0|1 preread=<MB/s|0> opt.<core option>=<value>\n");
 }
 
 int main(int argc, char **argv)
@@ -316,7 +348,7 @@ int main(int argc, char **argv)
     audio_init(opt.audio, arate);
     input_init(!core_mode);   /* beside Main_MiSTer, leave the devices shared so its OSD keeps working */
 
-    prewarm_file(opt.game);
+    prewarm_file(opt.game, opt.preread);
     if (opt.prof) prof_start(opt.prof);
     video_overlay(opt.fps);
     long times[STAT_N], runs[STAT_N]; int nt = 0; long worst = 0;

@@ -466,3 +466,32 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   of them; three starts read 60.00/60.02/60.03 Hz on the new core, where
   the old code read 60.24 and 60.32.
 
+## 2026-09-19: the game over CIFS (issue #1, second round)
+
+- The reporter (alpha-20260918, SorR.dat on a CIFS mount) still saw
+  brief stutters in busy sections, `fbcopy` at 8 ms for most of the run,
+  25-36 dropped frames per 600 and a climbing `audio_err`. Reproduced
+  here with the .dat on the NAS (macOS SMB server, wired gigabit,
+  `mount -t cifs ... -o guest,vers=3.0`; the daemon had to be bypassed
+  because Main rewrites /tmp/FULLPATH from the mounted image, so the
+  frontend was started by hand with `--core game=/tmp/nas/...`).
+  Result: for the first 80 s, while the 4 MB/s pre-read is still pulling
+  the 320 MB file, every window shows 3-8 drops, p99 20-34 ms and
+  audio_err ticking up (each read the game makes before the pre-read gets
+  there is a network round trip); after that the run is identical to the
+  SD card, 0 drops, fbcopy 2.3 ms. So CIFS explains the reporter's stalls
+  in the first minute or two but not the 8 ms fbcopy (a plain memory
+  copy on CPU 1): that needs something else eating that CPU, most likely
+  SMB signing/encryption or a USB Wi-Fi adapter; asked for their mount
+  options and `top`.
+- Change: the pre-read rate is now 16 MB/s when the game sits on a
+  network filesystem (cifs/smb3/nfs/fuse, found from the longest
+  matching mount point in /proc/mounts; `statfs()` returned garbage for
+  the CIFS path in this zig/glibc-2.17 build, f_type 0) and stays 4 MB/s
+  on local storage where the concern was memory bandwidth, not latency.
+  `preread=<MB/s>` in bennugd.cfg overrides, 0 disables.
+- Issue #2's log, read the same way: their slow "club screen" session ran
+  at 640x480 (graphics mode 2x: fbcopy 10-11 ms, run p50 13-14 ms, 40-57
+  drops per 600); at 416x240 on the fixed frontend they have ~0 drops and
+  the heavy scenes sit at 15-17 ms per frame, i.e. the interpreter.
+
