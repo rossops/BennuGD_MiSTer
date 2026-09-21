@@ -39,8 +39,11 @@ static long sysfs_read_long(const char *path)
 void launcher_set_cpu_mhz(int mhz)
 {
     if (access(CPUFREQ "scaling_max_freq", W_OK) < 0) {
-        host_log("cpu: no cpufreq in this kernel (MiSTer Linux 20260912 or later has it), staying at stock 800 MHz");
-        return;
+        /* the driver is a module that nothing loads by default: the opt-in */
+        if (system("modprobe socfpga-cpufreq >/dev/null 2>&1") != 0 || access(CPUFREQ "scaling_max_freq", W_OK) < 0) {
+            host_log("cpu: no cpufreq in this kernel (MiSTer Linux 20260912 or later has it), staying at stock 800 MHz");
+            return;
+        }
     }
     char v[24]; snprintf(v, sizeof v, "%d000", mhz);
     if (mhz > 800) sysfs_write("/sys/devices/system/cpu/cpufreq/boost", "1");

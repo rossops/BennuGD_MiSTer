@@ -582,4 +582,18 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
 - Daemon (earlier today, alpha-20260921): the frontend's stdout/stderr go
   to bennugd.log and the exit status is logged, for issue #3 where the
   frontend died before opening its log.
+- **Overclock (later that day).** 3s-mister-arm does not touch the PLL
+  itself: it writes cpufreq sysfs. MiSTer's kernel gained that driver on
+  2026-09-08 (`drivers/cpufreq/socfpga-cpufreq.c` + `clk-mister-cpu.c`:
+  VCO numer 63/79/95 for 800/1000/1200 MHz, reprogrammed from OCRAM),
+  built as a module nobody loads, with 1000/1200 behind
+  `/sys/devices/system/cpu/cpufreq/boost`. Linux release 20260912 carries
+  it. `cpu=` in bennugd.cfg loads the module, enables boost, pins the
+  performance governor, sets min/max and logs `scaling_cur_freq`; 800 MHz
+  is restored on exit. On our stock DE10-Nano the board froze solid (no
+  watchdog, power cycle) on the first switch, twice: once stepping
+  800 -> 1000 -> 1200 with a timing loop, once going straight to 1000 with
+  nothing else running. Not usable here; the option stays, off by default
+  and marked experimental, for boards and kernel builds where the switch
+  works.
 
