@@ -39,6 +39,7 @@ static struct {
     unsigned long fb;
     int dump_every, frames, menu, fps;
     int preread;                    /* MB/s for the page-cache pre-read; -1 auto, 0 off */
+    int cpu;                    /* cpu= MHz, 0 leaves the clock alone */
     struct { char *key, *val; } vars[MAX_VARS];
     int nvars;
 } opt = { .audio = "default", .preread = -1 };
@@ -99,6 +100,7 @@ static int apply_setting(const char *key, const char *val)
     else if (!strcmp(key, "fps")) opt.fps = atoi(val);
     else if (!strcmp(key, "preread")) opt.preread = atoi(val);
     else if (!strcmp(key, "prof")) opt.prof = strdup(val);
+    else if (!strcmp(key, "cpu")) opt.cpu = atoi(val);
     else if (!strncmp(key, "opt.", 4)) set_var(key + 4, val);
     else return -1;
     return 0;
@@ -269,7 +271,7 @@ static void usage(void)
     fprintf(stderr,
         "usage: bennugd <game.dat|--core> [key=value ...]\n"
         "  game= log= audio=(default|none|<alsa device>) fb=0x22000000|0 dump_dir= dump_every=N\n"
-        "  frames=N menu=0|1 prof=<dump file> fps=0|1 preread=<MB/s|0> opt.<core option>=<value>\n");
+        "  frames=N menu=0|1 prof=<dump file> fps=0|1 preread=<MB/s|0> cpu=800|1000|1200 opt.<core option>=<value>\n");
 }
 
 int main(int argc, char **argv)
@@ -295,6 +297,7 @@ int main(int argc, char **argv)
     if (chdir(game_dir) < 0) host_log("chdir %s failed", game_dir);
     host_log("bennugd: game %s (dir %s)", opt.game, game_dir);
 
+    if (opt.cpu) launcher_set_cpu_mhz(opt.cpu);
     signal(SIGINT, on_signal); signal(SIGTERM, on_signal);
     {
         struct sigaction sa = { .sa_sigaction = on_crash, .sa_flags = SA_SIGINFO };
@@ -395,6 +398,7 @@ int main(int argc, char **argv)
     retro_deinit();
     sync();                         /* save files out of the page cache before anyone pulls the plug */
     input_close(); audio_close(); video_close();
+    launcher_restore_cpu();
     if (gfd >= 0) close(gfd);
     if (opt.menu && stop != 2) launcher_return_to_menu();
     return 0;

@@ -50,5 +50,7 @@ void prof_dump(void);
 
 /* launcher.c: the way back to the MiSTer menu. */
 void launcher_return_to_menu(void);
+void launcher_set_cpu_mhz(int mhz);   /* 400, 800, 1000 or 1200; needs MiSTer Linux 20260912+ */
+void launcher_restore_cpu(void);      /* back to 800 MHz if it was changed */
 
 #endif
