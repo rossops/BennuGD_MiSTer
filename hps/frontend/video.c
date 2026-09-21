@@ -11,9 +11,11 @@
 #define _GNU_SOURCE
 #include "host.h"
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
@@ -21,10 +23,10 @@
 #include <sched.h>
 #include <arm_neon.h>
 
-/* The framebuffer mapping is uncached device memory: plain memcpy stores
- * 4 bytes at a time and every store goes to DDR. 16-byte NEON stores cut
- * the number of bus transactions; rows are 2-byte pixels so handle the
- * unaligned tail with a plain copy. */
+/* The framebuffer mapping is uncached: plain memcpy stores 4 bytes at a
+ * time and every store goes to DDR. 16-byte NEON stores cut the number of
+ * bus transactions; rows are 2-byte pixels so handle the unaligned tail
+ * with a plain copy. */
 static void copy_row(uint8_t *dst, const uint8_t *src, size_t n)
 {
     while (n >= 64) {
@@ -52,11 +54,12 @@ static volatile uint32_t *ctl;
 static bool      have_ctl;
 static unsigned  fixed_w, fixed_h;
 static unsigned  cur_w, cur_h;    /* geometry published in the block */
-/* The uncached copy into DDR3 costs 2.5 ms whatever the instruction mix,
- * about 15 % of a frame. It runs on a helper thread (the second A9 core
- * is mostly idle) while the game computes the next frame: video_present
- * only copies the core surface into a cached staging buffer and hands it
- * over. The helper also does the flip bookkeeping and the vblank wait. */
+/* The copy into DDR3 costs 1.2 ms per 640x480 frame through the
+ * write-combining mapping (7 ms strongly ordered, see map_fb). It runs on
+ * a helper thread (the second A9 core is mostly idle) while the game
+ * computes the next frame: video_present only copies the core surface
+ * into a cached staging buffer and hands it over. The helper also does
+ * the flip bookkeeping and the vblank wait. */
 static pthread_t       copier;
 static void *copier_main(void *arg);
 static void pin_to_cpu(int cpu);
@@ -92,6 +95,55 @@ static uint32_t wait_vblank_change(uint32_t seen, long timeout_us)
     }
 }
 
+/* /dev/mem maps the FPGA's DDR region strongly ordered (it lies outside
+ * Linux RAM): each 16-byte store waits for the bus, 92 MB/s, 7 ms per
+ * 640x480 frame. The MiSTer fb driver (/dev/fb0) covers the same DDR and
+ * the kernel maps it write-combining: 530 MB/s, 1.2 ms. Map through fb0
+ * where it covers our buffers and fill the rest (buffer 0 starts one page
+ * below fb0's smem_start) from /dev/mem, all inside one reserved range so
+ * the buffers stay contiguous. A write through the fb0 mapping is read
+ * back through /dev/mem, which bypasses the caches: a kernel whose fb0 is
+ * cached would fail that and fall back to /dev/mem. */
+static uint8_t *map_fb(unsigned long phys, size_t len)
+{
+    uint8_t *v = mmap(NULL, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (v == MAP_FAILED) return NULL;
+    unsigned long lo = phys, hi = phys + len, wc_lo = 0, wc_hi = 0;
+    struct fb_fix_screeninfo fix;
+    int fbfd = open("/dev/fb0", O_RDWR);
+    if (fbfd >= 0 && ioctl(fbfd, FBIOGET_FSCREENINFO, &fix) == 0) {
+        wc_lo = (fix.smem_start > lo ? fix.smem_start : lo);
+        wc_hi = (fix.smem_start + fix.smem_len < hi ? fix.smem_start + fix.smem_len : hi);
+        wc_lo = (wc_lo + 4095) & ~4095UL; wc_hi &= ~4095UL;
+    }
+    if (wc_lo < wc_hi) {
+        if (mmap(v + (wc_lo - lo), wc_hi - wc_lo, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fbfd, (off_t)(wc_lo - fix.smem_start)) == MAP_FAILED) {
+            host_log("video: /dev/fb0 mmap failed, using /dev/mem");
+            wc_lo = wc_hi = 0;
+        } else {
+            volatile uint32_t *chk = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, (off_t)wc_lo);
+            bool ok = chk != MAP_FAILED;
+            if (ok) {
+                volatile uint32_t *wc = (volatile uint32_t *)(v + (wc_lo - lo));
+                wc[0] = 0x5a1ee7u; wc[1] = ~0x5a1ee7u; __asm__ volatile("dsb" ::: "memory");
+                ok = chk[0] == 0x5a1ee7u && chk[1] == ~0x5a1ee7u;
+                munmap((void *)chk, 4096);
+            }
+            if (!ok) { host_log("video: /dev/fb0 mapping does not reach DDR, using /dev/mem"); wc_lo = wc_hi = 0; }
+        }
+    }
+    if (fbfd >= 0) close(fbfd);
+    if (wc_lo >= wc_hi) { wc_lo = wc_hi = lo; }
+    if (wc_lo > lo && mmap(v, wc_lo - lo, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memfd, (off_t)lo) == MAP_FAILED) goto fail;
+    if (wc_hi < hi && mmap(v + (wc_hi - lo), hi - wc_hi, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memfd, (off_t)wc_hi) == MAP_FAILED) goto fail;
+    host_log("video: framebuffer 0x%lx: %lu KB write-combining via /dev/fb0, %lu KB via /dev/mem",
+             phys, (wc_hi - wc_lo) / 1024, (len - (wc_hi - wc_lo)) / 1024);
+    return v;
+fail:
+    munmap(v, len);
+    return NULL;
+}
+
 int video_init(unsigned long fb_phys, unsigned w, unsigned h, const char *dir, int every)
 {
     dumpdir = dir;
@@ -101,8 +153,8 @@ int video_init(unsigned long fb_phys, unsigned w, unsigned h, const char *dir, i
     memfd = open("/dev/mem", O_RDWR | O_SYNC);
     if (memfd < 0) { host_log("video: open /dev/mem failed"); return -1; }
     fb_len = 2 * FB_STRIDE_BUF;
-    fb = mmap(NULL, fb_len, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, (off_t)fb_phys);
-    if (fb == MAP_FAILED) { host_log("video: mmap 0x%lx failed", fb_phys); fb = NULL; return -1; }
+    fb = map_fb(fb_phys, fb_len);
+    if (!fb) { host_log("video: mmap 0x%lx failed", fb_phys); return -1; }
     ctl = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, (off_t)CTL_PHYS);
     if (ctl == MAP_FAILED) { host_log("video: mmap control block failed"); ctl = NULL; }
     memset(fb, 0, fb_len);
@@ -196,6 +248,7 @@ static void *copier_main(void *arg)
             uint8_t *dst = fb + target * FB_STRIDE_BUF;
             for (unsigned y = 0; y < h; y++)
                 copy_row(dst + y * stride, staging[reading] + y * w * 2, w * 2);
+            __asm__ volatile("dsb" ::: "memory");   /* drain the write-combining buffer before the flip is published */
             ctl[CTL_PRESENT] = (uint32_t)target;
             pending = target;
             published_v = v;

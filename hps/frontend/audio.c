@@ -7,7 +7,9 @@
 #define _GNU_SOURCE
 #include "host.h"
 #include <dlfcn.h>
+#include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ACC_MAX     16384u    /* input frames buffered between flushes */
@@ -43,6 +45,30 @@ static unsigned  errors;
 static unsigned  prefill_frames;
 static long      level_frames = -1;   /* queued frames at the last flush, for the stats */
 static int       trim;                /* +1 duplicate / -1 drop one frame per flush: rate regulation */
+static int       vol_shift, vol_boost; /* OSD "Core Volume": attenuation in 6 dB steps, boost in 6 dB steps */
+static time_t    vol_checked;
+
+/* Main applies the OSD's Core Volume to the FPGA core's audio only (the
+ * framework's filter stage sits before the Linux audio is mixed in), so it
+ * never reaches sound that arrives through ALSA. Main also saves the value
+ * to config/<core>_volume.cfg, one byte: bits 0-2 attenuate (shift right),
+ * bits 5-6 boost. Apply that here, re-read once a second. */
+static void read_core_volume(void)
+{
+    time_t now = time(NULL);
+    if (now == vol_checked) return;
+    vol_checked = now;
+    int shift = 0, boost = 0;
+    FILE *f = fopen("/media/fat/config/BennuGD_volume.cfg", "rb");
+    if (f) {
+        int c = fgetc(f); fclose(f);
+        if (c != EOF) { shift = c & 7; if (shift > 6) shift = 6; boost = (c >> 5) & 3; if (boost > 2) boost = 2; }
+    }
+    if (shift != vol_shift || boost != vol_boost) {
+        host_log("audio: core volume -%d dB%s", shift * 6, boost ? (boost == 1 ? " +6 dB boost" : " +12 dB boost") : "");
+        vol_shift = shift; vol_boost = boost;
+    }
+}
 
 /* With vsync the game produces audio exactly as fast as it is consumed, so
  * the buffer level never rises on its own: it stays where it started. Start
@@ -121,7 +147,15 @@ void audio_push(const int16_t *lr, size_t frames)
 {
     if (!pcm) return;
     if (acc_n + frames > ACC_MAX) { errors++; frames = ACC_MAX - acc_n; }
-    memcpy(acc + acc_n * 2, lr, frames * 4);
+    read_core_volume();
+    if (!vol_shift && !vol_boost) memcpy(acc + acc_n * 2, lr, frames * 4);
+    else {
+        int16_t *d = acc + acc_n * 2;
+        for (size_t i = 0; i < frames * 2; i++) {
+            int v = ((int)lr[i] << vol_boost) >> vol_shift;
+            d[i] = v > 32767 ? 32767 : v < -32768 ? -32768 : v;
+        }
+    }
     acc_n += frames;
 }
 

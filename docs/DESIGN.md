@@ -552,3 +552,34 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   training data is the benchmark sequence itself, so gameplay may gain a
   little less.
 
+## 2026-09-21: the frame copy through /dev/fb0, Core Volume (issue #1, third round)
+
+- **fbcopy was 7.3 ms at 640x480 on every device**, ours included; the
+  reporter's 7.5-8 ms was not their card. /dev/mem maps the FPGA's DDR
+  region (outside Linux RAM, so `pfn_valid` is false) strongly ordered:
+  every 16-byte NEON store waits for the bus, 92 MB/s. The MiSTer fb
+  driver (`/dev/fb0`, `MiSTer_fb`, smem 0x22001000 len 0x7e9000 on the
+  20260907 image) covers the same DDR and the kernel maps it
+  write-combining (`fb_pgprotect` on ARM): 531 MB/s, 1.16 ms per 640x480
+  frame in a standalone test, 1.3-1.5 ms in play. `map_fb` in video.c
+  reserves the 2 MB range, maps the part fb0 covers from fb0 and the rest
+  (buffer 0's first page, 0x22000000 is one page below smem_start) from
+  /dev/mem, writes a pattern through fb0 and reads it back through
+  /dev/mem (which bypasses the caches) so a kernel whose fb0 turned out
+  cached would fall back to /dev/mem, and a `dsb` drains the write buffer
+  before the present index is published. The 6.18.38 kernel's fb0 mmap
+  works; the Console-Mode report about it broken concerned something else.
+- **The bad periods** (p50 11-18 ms, airplane scene) match our own heavy
+  scenes: interpreter-bound, not video, audio or storage. The 0.4-0.9 s
+  single stalls appear in our log too at scattered frames, most likely
+  level loads.
+- **Core Volume.** Main sends it to the framework's audio filter
+  (`UIO_SET_AFILTER`), which attenuates the core's audio before
+  `aud_mix_top` adds the Linux audio; master volume (`UIO_AUDVOL`,
+  `vol_att`) is applied after the mix and does work. Main saves the core
+  value to `config/BennuGD_volume.cfg` (one byte: bits 0-2 shift, bits
+  5-6 boost); audio.c re-reads it once a second and scales the samples.
+- Daemon (earlier today, alpha-20260921): the frontend's stdout/stderr go
+  to bennugd.log and the exit status is logged, for issue #3 where the
+  frontend died before opening its log.
+

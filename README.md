@@ -132,6 +132,12 @@ software, which the ARM cannot keep up with; set `BORDERLESS_SYNC` in
 1x / normal in the game's own options. The heaviest scenes still drop
 frames on the stock 800 MHz CPU; that is the known limit right now.
 
+**The OSD's Core Volume does nothing.** MiSTer applies it to the FPGA
+core's own audio, before the Linux audio is mixed in, so it cannot reach
+this game's sound. The frontend reads the value MiSTer saves and applies
+it itself, so it works, with a delay of a second or two. The master
+Volume (and the volume keys) work at once.
+
 **Nothing starts when picking the game.** Check
 `/media/fat/bennugd/launcherd.log`. The daemon must be running (the
 setup script starts it, and `user-startup.sh` starts it at boot).
