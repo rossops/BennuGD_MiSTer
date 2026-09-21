@@ -12,6 +12,7 @@
 BIN=/media/fat/bennugd/bennugd
 GAMES=/media/fat/games/BennuGD
 LOG=/media/fat/bennugd/launcherd.log
+FLOG=/media/fat/bennugd/bennugd.log   # the frontend appends to it too; exec/loader errors land here
 last_core=""
 last_game=""
 pid=""
@@ -59,9 +60,9 @@ while :; do
     core=$(cat /tmp/CORENAME 2>/dev/null)
     # a crashed frontend leaves a black screen with the core still loaded: restart it
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
-        wait "$pid" 2>/dev/null
+        wait "$pid" 2>/dev/null; st=$?
         sync
-        log "frontend pid $pid died (see bennugd.log), restarting"
+        log "frontend pid $pid died (exit $st, see bennugd.log), restarting"
         pid=""; last_game="(restart)"
     fi
     game=""
@@ -78,9 +79,9 @@ while :; do
             # (no prof= here: the sampler's timer signal disturbs the audio pacing;
             #  put prof=/media/fat/bennugd/prof.bin in bennugd.cfg for a profiling session)
             if [ -n "$game" ]; then
-                "$BIN" --core "game=$game" &
+                "$BIN" --core "game=$game" >>"$FLOG" 2>&1 &
             else
-                "$BIN" --core &
+                "$BIN" --core >>"$FLOG" 2>&1 &
             fi
             pid=$!
             # Main busy-polls the FPGA on one core the whole time our core is
