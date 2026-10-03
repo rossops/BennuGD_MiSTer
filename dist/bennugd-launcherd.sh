@@ -79,6 +79,10 @@ while :; do
             n=0   # an .mgl mounts its file after its delay: give it a few seconds
             while [ $n -lt 8 ] && [ -z "$game" ]; do sleep 0.5; n=$((n + 1)); game=$(resolve_game); done
         fi
+        # Main rewrites /tmp/FULLPATH with the directory being browsed whenever
+        # the OSD file browser is open; that is not a new game. While the core
+        # stays loaded and a frontend runs, keep the game it is running.
+        [ -z "$game" ] && [ "$core" = "$last_core" ] && [ -n "$pid" ] && game=$last_game
     fi
     if [ "$core" != "$last_core" ] || [ "$game" != "$last_game" ]; then
         stop_game

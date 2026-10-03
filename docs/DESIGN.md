@@ -696,7 +696,9 @@ input_event records, which the frontend reads as the keyboard):
 - Also seen: the daemon restarts the frontend when the OSD file browser
   is open (Main rewrites /tmp/FULLPATH with the browsed directory on every
   listing), and the user could not trigger the Select+Start exit chord in
-  5.1; neither is fixed yet.
+  5.1. Both fixed the same day: the daemon keeps the running game when the
+  path file stops resolving while the core is still loaded and a frontend
+  runs (alpha-20261003b); the chord, see below.
 - Exit gesture (frontend, input.c): Start held 3 s, or Select+Start, now
   presses F12 for the game (RETRO_DEVICE_KEYBOARD) for 20 polls and arms a
   5 s hard stop; the game quits through RETRO_ENVIRONMENT_SHUTDOWN, having
