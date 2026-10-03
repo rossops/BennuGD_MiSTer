@@ -45,6 +45,7 @@ static unsigned  errors;
 static unsigned  prefill_frames;
 static long      level_frames = -1;   /* queued frames at the last flush, for the stats */
 static int       trim;                /* +1 duplicate / -1 drop one frame per flush: rate regulation */
+static unsigned  topups;              /* extra chunks mixed because the game fell behind real time */
 static int       vol_shift, vol_boost; /* OSD "Core Volume": attenuation in 6 dB steps, boost in 6 dB steps */
 static time_t    vol_checked;
 
@@ -194,7 +195,32 @@ void audio_flush(void)
     acc_n = 0;
 }
 
+/* The core mixes one frame's worth of audio (735 frames at 60 fps) per
+ * retro_run, however long that run took. In a heavy scene at 17-18 ms a
+ * frame the queue drains by a millisecond or two per frame, underruns
+ * every few seconds and restarts with 90 ms of silence: the "crackle on
+ * busy levels". When the queue has fallen a chunk below the primed level,
+ * have the core mix extra chunks (its RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK
+ * entry, 1024 frames each, delivered through audio_push) until it is back
+ * near the target. The music then plays on at the right speed and only
+ * the picture slows down. A fast game never gets here: the blocking
+ * writes in audio_flush keep the queue at the target. */
+void audio_topup(void (*mix)(void))
+{
+    if (!pcm || !mix) return;
+    for (int i = 0; i < 8; i++) {
+        long d;
+        if (p_delay(pcm, &d) < 0) return;
+        if (d >= (long)prefill_frames - 1024) return;
+        mix();
+        if (!acc_n) return;            /* the core had nothing for us */
+        topups++;
+        audio_flush();
+    }
+}
+
 unsigned audio_errors(void) { return errors; }
+unsigned audio_topups(void) { return topups; }
 long     audio_level_ms(void) { return level_frames < 0 ? -1 : level_frames * 1000 / 44100; }
 bool     audio_active(void) { return pcm != NULL; }
 

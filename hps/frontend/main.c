@@ -123,6 +123,12 @@ static void read_cfg(const char *path)
     fclose(f);
 }
 
+/* The core's audio callback mixes one 1024-frame chunk into audio_batch_cb.
+ * We keep the core in its per-frame upload mode (its set_state callback is
+ * never called) and use this entry only to top the queue up when the game
+ * runs slower than real time: see audio_topup. */
+static retro_audio_callback_t core_mix;
+
 static bool env_cb(unsigned cmd, void *data)
 {
     switch (cmd) {
@@ -151,6 +157,10 @@ static bool env_cb(unsigned cmd, void *data)
     case RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE: *(bool *)data = false; return true;
     case RETRO_ENVIRONMENT_GET_CORE_OPTIONS_VERSION: *(unsigned *)data = 0; return true;
     case RETRO_ENVIRONMENT_GET_TARGET_REFRESH_RATE: *(float *)data = 60.0f; return true;
+    case RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK:
+        core_mix = ((const struct retro_audio_callback *)data)->callback;
+        host_log("env: audio callback registered (used to top the queue up when the game is behind)");
+        return core_mix != NULL;
     case RETRO_ENVIRONMENT_SET_SYSTEM_AV_INFO:
         av = *(struct retro_system_av_info *)data;
         host_log("env: av info %ux%u @ %.3f fps, %.0f Hz",
@@ -365,6 +375,7 @@ int main(int argc, char **argv)
         retro_run();
         clock_gettime(CLOCK_MONOTONIC, &tr);
         audio_flush();                 /* blocks on the ALSA buffer: this is the audio clock */
+        audio_topup(core_mix);         /* the game ran slower than real time: mix extra audio, no gap */
         clock_gettime(CLOCK_MONOTONIC, &t1);
         long run_us = (tr.tv_sec - t0.tv_sec) * 1000000L + (tr.tv_nsec - t0.tv_nsec) / 1000;
         video_overlay_run_us(run_us);
@@ -376,9 +387,9 @@ int main(int argc, char **argv)
         if (nt == STAT_N) {
             qsort(times, STAT_N, sizeof *times, cmp_long);
             qsort(runs, STAT_N, sizeof *runs, cmp_long);
-            host_log("stats: frame %ld run p50 %ld p99 %ld max %ld us | frame+audio p50 %ld p99 %ld us | fbcopy %ld us dropped %u | rss %ld kB audio_err %u level %ld ms",
+            host_log("stats: frame %ld run p50 %ld p99 %ld max %ld us | frame+audio p50 %ld p99 %ld us | fbcopy %ld us dropped %u | rss %ld kB audio_err %u topup %u level %ld ms",
                      frame, runs[STAT_N / 2], runs[STAT_N * 99 / 100], worst,
-                     times[STAT_N / 2], times[STAT_N * 99 / 100], video_copy_us(), video_dropped(), rss_kb(), audio_errors(), audio_level_ms());
+                     times[STAT_N / 2], times[STAT_N * 99 / 100], video_copy_us(), video_dropped(), rss_kb(), audio_errors(), audio_topups(), audio_level_ms());
             nt = 0; worst = 0;
         }
         if (audio_active()) continue;   /* the full ALSA buffer is the clock; video never blocks */

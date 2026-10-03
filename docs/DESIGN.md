@@ -597,3 +597,48 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   and marked experimental, for boards and kernel builds where the switch
   works.
 
+
+## 2026-10-02: audio on busy levels, and a real A/B of the releases
+
+- **The complaint.** Sound breaks up on busy levels, and it felt like a
+  regression. The log tells the story in numbers: in heavy scenes `run
+  p50` sits at 15-17 ms, `frame+audio p50` creeps above 16.7 ms, `level`
+  sinks from 92 ms to single digits and `audio_err` climbs by 5-8 per
+  10 s window. The core mixes exactly one frame of audio (735 frames at
+  60 fps) per `retro_run`, however long that run took, so a game that
+  runs slower than real time starves the queue. Each underrun restarts
+  the stream with 92 ms of silence, which is the gap you hear.
+- **Top-up (audio_topup in audio.c).** The core offers
+  `RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK`; its callback mixes a 1024-frame
+  chunk into `audio_batch_cb` on whatever thread calls it. The frontend
+  accepts the registration but never calls `set_state`, so the core keeps
+  its per-frame upload and the callback is only used after `audio_flush`
+  when `snd_pcm_delay` is more than a chunk below the primed level: mix a
+  chunk, write it, repeat (at most 8). The mixing runs on the game thread
+  between frames, the same place the core mixes anyway, so SDL_mixer sees
+  nothing new. A fast game never gets there, because the blocking write
+  already holds the queue at the target. The stats line gained `topup N`.
+- **Benchmark trap.** `cp` over `/media/fat/bennugd/bennugd` while the
+  frontend runs fails with "Text file busy" (exFAT) and the first two A/B
+  passes silently measured the installed release three times. Swap with
+  `cp bennugd.new && mv -f` and check the md5 in the run's own output.
+  The attract sequence also changed since 09-19: the card's save state now
+  picks heavy demo stages (A p50 15.8 ms where it was 6.6), so compare
+  only within one day.
+- **Results, same attract sequence, one run each** (A frames 1200-6000,
+  B 6600-11400, underruns over the 190 s run):
+
+  | binary          | A p50   | B p50   | underruns | top-ups |
+  |-----------------|---------|---------|-----------|---------|
+  | alpha-20260918  | 15.1 ms | 14.4 ms | 54        | -       |
+  | alpha-20260919b | 15.8 ms | 15.2 ms | 108       | -       |
+  | alpha-20260921b | 15.8 ms | 15.2 ms | 99-121    | -       |
+  | top-up build    | 15.8 ms | 15.2 ms | 3 (startup load) | 518 |
+
+  So there was a real step: the 09-19 interpreter round (patch 0006, PGO,
+  hidden visibility) is 4-5 % slower on these heavy stages, the opposite
+  of what the light attract sequence showed that day, and that doubled
+  the underruns. Not yet separated into which of the three did it; the
+  profile was trained on the light sequence, so PGO is the first suspect
+  (`PGO=off hps/build.sh` to test). The top-up removes the underruns
+  either way.
