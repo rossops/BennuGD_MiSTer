@@ -10,7 +10,19 @@ BUILD_DIR=${BUILD_DIR:-$HOME/.cache/bennugd-mister/build-armhf}
 export PATH="$ZIG_DIR:$PATH"
 zig version >/dev/null
 # Local changes to the upstream core live in hps/patches (see docs/DESIGN.md);
-# apply the ones a fresh submodule checkout does not have yet.
+# apply the ones a fresh submodule checkout does not have yet. A patch that
+# overlaps a later one no longer reverse-applies on its own, so first check
+# the whole stack: patch a scratch index and compare it with the tree.
+idx=$(mktemp)
+stack_applied=yes
+GIT_INDEX_FILE=$idx git -C "$HERE/BennuGD_libretro" read-tree HEAD
+for p in "$HERE"/patches/*.patch; do
+    [ -e "$p" ] || continue
+    GIT_INDEX_FILE=$idx git -C "$HERE/BennuGD_libretro" apply --cached "$p" 2>/dev/null || stack_applied=no
+done
+[ "$stack_applied" = yes ] && GIT_INDEX_FILE=$idx git -C "$HERE/BennuGD_libretro" diff --quiet || stack_applied=no
+rm -f "$idx"
+[ "$stack_applied" = yes ] ||
 for p in "$HERE"/patches/*.patch; do
     [ -e "$p" ] || continue
     if git -C "$HERE/BennuGD_libretro" apply --check --reverse "$p" >/dev/null 2>&1; then

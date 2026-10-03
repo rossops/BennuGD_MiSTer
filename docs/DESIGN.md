@@ -767,3 +767,45 @@ a heavy stage is worth another try.
 Also checked while there: the `switch` in instance_go compiles to one
 jump table behind a single `add pc` (plus a bounds check per opcode).
 That is the next target (direct-threaded dispatch).
+
+## 2026-10-03 night: threaded dispatch in instance_go (patch 0007)
+
+- **What it does.** Every opcode used to end in `break`, fall to the
+  shared tail (stack check, the `check` flag of patch 0006) and loop back
+  to the one `switch` jump. Now each opcode ends in its own indirect jump
+  through `op_table`, a 0x1003-entry table of label addresses (opcode
+  values are mnemonic | type | params bits, all below 0x1000; the gaps
+  point at `default`). `break` became `NEXT` and `continue` became
+  `CONTINUE`. The patch was generated mechanically: 227 breaks, 9
+  continues, 359 case labels, and the only loop inside the switch has no
+  `break`.
+- **LLVM undoes it unless told otherwise.** Clang funnels every
+  `goto *` of a function into one block and relies on tail duplication
+  to copy it back into each predecessor. Two things stood in the way. The
+  first build had one indirect jump in the whole function: the dispatch
+  tail had conditional branches (stack check, `check`, bounds), and tail
+  duplication only copies a single block. So the slow paths are table
+  entries now, picked with selects: `OP_SLOW_NEXT` (stack check, then the
+  loop head), `OP_SLOW_CONTINUE` (the loop head) and `OP_UNKNOWN`. The
+  dispatch is about 8 instructions with conditional moves, then `ldr`
+  and `bx`. Even then LLVM 19 refuses to duplicate a block with more
+  than 16 predecessors or successors (`-tail-dup-pred-size`,
+  `-tail-dup-succ-size`), so `hps/CMakeLists.txt` raises both to 1000
+  for `interpreter.c` only (`COMPILE_FLAGS`; the `SHELL:` form of
+  `COMPILE_OPTIONS` does not work on a source file). Result: 238
+  indirect jumps in instance_go instead of 1.
+- **Exactness.** `THREADED_DISPATCH=0` turns the macros back into `break`
+  and `continue`, and that build's `.text` is byte-identical to the
+  no-PGO binary from before the patch.
+- **Numbers.** A-B-A on the attract recipe, heavy stage (frames
+  6600-9000, `run p50` averaged): 14.27 ms, threaded 13.87 ms, 14.28 ms,
+  so -2.8 %. Top-ups during the run 5-9 -> 1-2. Light scenes come out
+  even. Less than hoped: on the A9 the shared jump was not the big cost,
+  the opcode bodies are. With PGO dropped, the heavy stage went from
+  15.5 to 13.9 ms in one day.
+- **build.sh.** 0007 sits on top of lines that 0004 and 0006 changed, so
+  their per-patch reverse checks fail on a rebuild and the old loop
+  printed "patch failed" every time (harmless, nothing was applied).
+  `build.sh` now applies the whole stack to a scratch index first
+  (`GIT_INDEX_FILE`, `apply --cached`) and skips the loop when that
+  matches the working tree.

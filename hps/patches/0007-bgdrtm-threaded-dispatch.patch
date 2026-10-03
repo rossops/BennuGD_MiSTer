@@ -1,0 +1,4727 @@
+--- a/core/bgdrtm/src/interpreter.c
++++ b/core/bgdrtm/src/interpreter.c
+@@ -1,2148 +1,2576 @@
+-/*
+- *  Copyright © 2006-2019 SplinterGU (Fenix/Bennugd)
+- *  Copyright © 2002-2006 Fenix Team (Fenix)
+- *  Copyright © 1999-2002 José Luis Cebrián Pagüe (Fenix)
+- *
+- *  This file is part of Bennu - Game Development
+- *
+- *  This software is provided 'as-is', without any express or implied
+- *  warranty. In no event will the authors be held liable for any damages
+- *  arising from the use of this software.
+- *
+- *  Permission is granted to anyone to use this software for any purpose,
+- *  including commercial applications, and to alter it and redistribute it
+- *  freely, subject to the following restrictions:
+- *
+- *     1. The origin of this software must not be misrepresented; you must not
+- *     claim that you wrote the original software. If you use this software
+- *     in a product, an acknowledgment in the product documentation would be
+- *     appreciated but is not required.
+- *
+- *     2. Altered source versions must be plainly marked as such, and must not be
+- *     misrepresented as being the original software.
+- *
+- *     3. This notice may not be removed or altered from any source
+- *     distribution.
+- *
+- */
+-
+-#include <stdio.h>
+-#include <stdlib.h>
+-#include <string.h>
+-
+-#include "bgdrtm.h"
+-#include "dcb.h"
+-
+-#include "sysprocs_p.h"
+-#include "pslang.h"
+-#include "instance.h"
+-#include "offsets.h"
+-#include "xstrings.h"
+-
+-#include <assert.h>
+-
+-/* ---------------------------------------------------------------------- */
+-/* Interpreter's main module                                              */
+-/* ---------------------------------------------------------------------- */
+-
+-int exit_value = 0;
+-int must_exit = 0;
+-
+-int frame_completed = 0;
+-
+-int trace_sentence  = -1;
+-INSTANCE * trace_instance = NULL;
+-
+-int debugger_show_console       = 0; // debuggin
+-int debugger_trace              = 0; // 1 single sentence
+-int debugger_step               = 0; // execute 1 sentence or 1 procedure or 1 function as an unit
+-
+-/* ---------------------------------------------------------------------- */
+-
+-// static int go_to_next_instance = 0;
+-
+-/* ---------------------------------------------------------------------- */
+-
+-static int stack_dump( INSTANCE * r ) {
+-    register int * ptr = &r->stack[1];
+-    register int i = 0;
+-
+-    while ( ptr < r->stack_ptr ) {
+-        if ( i == 5 ) {
+-            i = 0;
+-            printf( "\n" );
+-        }
+-        printf( "%08X ", *ptr++ );
+-        i++;
+-    }
+-
+-    return i;
+-}
+-
+-/* ---------------------------------------------------------------------- */
+-
+-int instance_go_all() {
+-
+-    INSTANCE * i = NULL;
+-    int n, status, i_count;
+-
+-    must_exit = 0;
+-
+-    while ( first_instance ) {
+-        frame_completed = 0;
+-
+-        // Reset iterator by priority
+-        instance_reset_iterator_by_priority(); // Don't must be neccessary
+-        i = instance_next_by_priority();
+-
+-        i_count = 0;
+-        while ( i ) {
+-            if ( LOCINT32( i, FRAME_PERCENT ) < 100 ) {
+-                status = LOCDWORD( i, STATUS );
+-                if ( status == STATUS_RUNNING ) {
+-                    /* Run instance */
+-                    /* Hook */
+-                    if ( process_exec_hook_count )
+-                        for ( n = 0; n < process_exec_hook_count; n++ )
+-                            process_exec_hook_list[n]( i );
+-                    /* Hook */
+-                } else if ( status != STATUS_KILLED && status != STATUS_DEAD ) { /* STATUS_SLEEPING OR STATUS_FROZEN OR STATUS_WAITING_MASK */
+-                    i = instance_next_by_priority();
+-                    continue;
+-                }
+-                /* If instance is KILLED or DEAD, run instance without exec_hook executed. */
+-
+-                instance_go( i );
+-
+-                i_count++;
+-
+-                if ( must_exit ) goto instance_go_all_exit;
+-
+-            }
+-
+-            i = instance_next_by_priority();
+-        }
+-
+-        /* If frame is complete, then update internal vars and execute main hooks. */
+-
+-        if ( !i_count ) {
+-            frame_completed = 1;
+-            /* Honors the signal-changed status of the process and
+-             * saves so it is used in this loop the next frame
+-             */
+-            i = first_instance;
+-            while ( i ) {
+-                status = LOCDWORD( i, SAVED_STATUS ) = LOCDWORD( i, STATUS );
+-                // if status == STATUS_KILLED or STATUS_DEAD then the process still lives
+-                if ( status == STATUS_DEAD || status == STATUS_KILLED || status == STATUS_RUNNING ) LOCINT32( i, FRAME_PERCENT ) -= 100;
+-
+-                if ( i->last_priority != LOCINT32( i, PRIORITY ) ) {
+-                    instance_dirty( i );
+-                    LOCINT32( i, SAVED_PRIORITY ) = LOCINT32( i, PRIORITY );
+-                }
+-
+-                i = i->next;
+-            }
+-
+-            if ( !first_instance ) break;
+-
+-            /* Hook */
+-            if ( handler_hook_count )
+-                for ( n = 0; n < handler_hook_count; n++ )
+-                    handler_hook_list[n].hook();
+-            /* Hook */
+-
+-            continue;
+-        }
+-    }
+-
+-instance_go_all_exit:
+-
+-    return exit_value;
+-
+-}
+-
+-/* ---------------------------------------------------------------------- */
+-
+-int instance_go( INSTANCE * r ) {
+-
+-    if ( !r ) return 0;
+-
+-    register int * ptr = r->codeptr;
+-    int * sp;                       /* r->stack_ptr, kept in a register across the loop and written back (r->stack_ptr = sp) before anything outside the loop may look at it */
+-    int * stack_base;
+-    uint32_t * status_p;            /* &LOCDWORD( r, STATUS ) */
+-    int check;                      /* re-read must_exit and the status: only the opcodes that run outside code can change them */
+-
+-    int n, return_value = LOCDWORD( r, PROCESS_ID );
+-    SYSPROC * p = NULL;
+-    INSTANCE * i = NULL;
+-    char * str = NULL;
+-    int status;
+-    void* tmp;
+-
+-    /* Pointer to the current process's code (it may be a called one) */
+-
+-    int child_is_alive = 0;
+-
+-    int debugger_step_pending = 0; // local to instance
+-
+-    /* ------------------------------------------------------------------------------- */
+-    /* Restore if exit by debug                                                        */
+-
+-    if ( debug > 0 ) {
+-        printf( "\n>>> Instance:%s ProcID:%d StackUsed:%d/%d\n", r->proc->name,
+-                                                                 LOCDWORD( r, PROCESS_ID ),
+-                                                                 (int)( r->stack_ptr - r->stack ) / (int)sizeof( r->stack[0] ),
+-                                                                 ( r->stack[0] & ~STACK_RETURN_VALUE )
+-              );
+-    }
+-
+-    /* Start process or return from frame */
+-    /* Hook */
+-    if ( instance_pre_execute_hook_count )
+-        for ( n = 0; n < instance_pre_execute_hook_count; n++ )
+-            instance_pre_execute_hook_list[n]( r );
+-    /* Hook */
+-
+-    // breakpoint on entry
+-    if ( r->proc->breakpoint || r->breakpoint ) {
+-        debugger_show_console = 1; // *** call debugger when info is available
+-        debugger_trace = 1;
+-    }
+-
+-main_loop_instance_go:
+-    sp = r->stack_ptr;
+-    stack_base = r->stack;
+-    status_p = ( uint32_t * )(( uint8_t * ) r->locdata + STATUS );
+-    check = 1;
+-    trace_sentence = -1;
+-
+-    while ( 1 ) {
+-
+-        /* If I was killed or I'm waiting status, then exit. Checked after the
+-           opcodes that call outside the loop (system calls, child processes);
+-           nothing else changes the status or must_exit while this runs. */
+-        if ( check ) {
+-            check = 0;
+-            if ( must_exit ) break;
+-            status = *status_p;
+-            if (( status & ~STATUS_WAITING_MASK ) == STATUS_KILLED || ( status & STATUS_WAITING_MASK ) )
+-            {
+-                r->codeptr = ptr;
+-                return_value = LOCDWORD( r, PROCESS_ID );
+-                goto break_all;
+-            }
+-        }
+-
+-#if !LIBRETRO_CORE
+-        /* The libretro build has no debugger console; these two checks cost
+-           a fifth of the interpreter loop on an ARM Cortex-A9, so they are
+-           compiled out (debug is never set there and a `debug` statement in
+-           the game would otherwise spin forever waiting for the console). */
+-        if ( trace_sentence != -1 ) {
+-             while( debugger_show_console ) {
+-                /* Hook */
+-                if ( handler_hook_count )
+-                    for ( n = 0; n < handler_hook_count; n++ )
+-                        handler_hook_list[n].hook();
+-                /* Hook */
+-            }
+-        }
+-
+-        /* debug output */
+-        if ( debug > 0 )
+-        {
+-            if ( debug > 2 )
+-            {
+-                r->stack_ptr = sp;
+-                int c = 45 - stack_dump( r ) * 9;
+-                if ( debug > 1 ) printf( "%*.*s[%4u] ", c, c, "", (int)( ptr - r->code ) );
+-            }
+-            else if ( debug > 1 ) printf( "[%4u] ", (int)( ptr - r->code ) );
+-            mnemonic_dump( *ptr, ptr[1] );
+-            fflush(stdout);
+-        }
+-#endif
+-
+-        switch ( *ptr )
+-        {
+-            /* No operation */
+-            case MN_NOP:
+-                ptr++;
+-                break;
+-
+-            /* Stack manipulation */
+-
+-            case MN_DUP:
+-                *sp = sp[-1];
+-                sp++;
+-                ptr++;
+-                break;
+-
+-            case MN_PUSH:
+-                *sp++ = ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_POP:
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_INDEX:
+-            case MN_INDEX | MN_UNSIGNED:
+-            case MN_INDEX | MN_STRING:
+-            case MN_INDEX | MN_WORD:
+-            case MN_INDEX | MN_WORD | MN_UNSIGNED:
+-            case MN_INDEX | MN_BYTE:
+-            case MN_INDEX | MN_BYTE | MN_UNSIGNED:
+-            case MN_INDEX | MN_FLOAT: /* Add float, I don't know why it was missing (SplinterGU) */
+-                sp[-1] += ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_ARRAY:
+-                sp[-2] += ( ptr[1] * sp[-1] );
+-                sp--;
+-                ptr += 2;
+-                break;
+-
+-            /* Process calls */
+-
+-            case MN_CLONE:
+-                r->stack_ptr = sp;
+-                i = instance_duplicate( r );
+-                i->codeptr = ptr + 2;
+-                ptr = r->code + ptr[1];
+-                continue;
+-
+-            case MN_CALL:
+-            case MN_PROC:
+-            {
+-                PROCDEF * proc = procdef_get( ptr[1] );
+-
+-                if ( !proc ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown process\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-
+-                /* Process uses FRAME or locals, must create an instance */
+-                r->stack_ptr = sp;
+-                i = instance_new( proc, r );
+-
+-                assert ( i );
+-
+-                for ( n = 0; n < proc->params; n++ )
+-                    PRIDWORD( i, 4 * n ) = sp[-proc->params+n];
+-
+-                sp -= proc->params;
+-
+-                /* I go to waiting status (by default) */
+-                LOCDWORD( r, STATUS ) |= STATUS_WAITING_MASK;
+-                i->called_by   = r;
+-
+-                if ( debugger_step ) {
+-                    debugger_step_pending = 1;
+-                    debugger_step = 0;
+-                }
+-
+-                /* Run the process/function */
+-                if ( *ptr == MN_CALL ) {
+-                    r->stack[0] |= STACK_RETURN_VALUE;
+-                    sp++;
+-                    r->stack_ptr = sp;
+-                    *sp = instance_go( i );
+-                } else {
+-                    r->stack[0] &= ~STACK_RETURN_VALUE;
+-                    r->stack_ptr = sp;
+-                    instance_go( i );
+-                }
+-
+-                if ( debugger_step_pending ) {
+-                    debugger_step_pending = 0;
+-                    debugger_step = 1;
+-                }
+-
+-                child_is_alive = instance_exists( i );
+-
+-                ptr += 2;
+-
+-                /* If the process is a function in a frame, save the stack and leave */
+-                /* If the process/function still running, then it is in a FRAME.
+-                   If the process/function is running code, then it his status is RUNNING */
+-                if ( child_is_alive &&
+-                        (
+-                            (( status = LOCDWORD( r, STATUS ) ) &  STATUS_WAITING_MASK ) ||
+-                            ( status & ~STATUS_WAITING_MASK ) == STATUS_FROZEN ||
+-                            ( status & ~STATUS_WAITING_MASK ) == STATUS_SLEEPING
+-                        )
+-                   ) {
+-                    /* I go to sleep and return from this process/function */
+-                    i->called_by   = r;
+-
+-                    /* Save the instruction pointer */
+-                    /* This instance don't run other code until the child return */
+-                    r->codeptr = ptr;
+-
+-                    /* If it don't was a CALL, then I set a flag in "len" for no return value */
+-                    if ( ptr[-2] == MN_CALL )   r->stack[0] |= STACK_RETURN_VALUE;
+-                    else                        r->stack[0] &= ~STACK_RETURN_VALUE;
+-
+-                    r->stack_ptr = sp;
+-                    return 0;
+-                }
+-
+-                /* Wake up! */
+-                LOCDWORD( r, STATUS ) &= ~STATUS_WAITING_MASK;
+-                if ( child_is_alive ) i->called_by = NULL;
+-
+-                check = 1;
+-                break;
+-            }
+-
+-            case MN_SYSCALL:
+-                p = sysproc_get( ptr[1] );
+-                if ( !p ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown system function\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp -= p->params;
+-                r->stack_ptr = sp;
+-                *sp = ( *p->func )( r, sp );
+-                sp++;
+-                ptr += 2;
+-                check = 1;
+-                break;
+-
+-            case MN_SYSPROC:
+-                p = sysproc_get( ptr[1] );
+-                if ( !p ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown system process\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp -= p->params;
+-                r->stack_ptr = sp;
+-                ( *p->func )( r, sp );
+-                ptr += 2;
+-                check = 1;
+-                break;
+-
+-            /* Access to variables address */
+-
+-            case MN_PRIVATE:
+-            case MN_PRIVATE | MN_UNSIGNED:
+-            case MN_PRIVATE | MN_WORD:
+-            case MN_PRIVATE | MN_BYTE:
+-            case MN_PRIVATE | MN_WORD | MN_UNSIGNED:
+-            case MN_PRIVATE | MN_BYTE | MN_UNSIGNED:
+-            case MN_PRIVATE | MN_STRING:
+-            case MN_PRIVATE | MN_FLOAT:
+-                *sp++ = ( uint32_t ) int_from_ptr(& PRIDWORD( r, ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            case MN_PUBLIC:
+-            case MN_PUBLIC | MN_UNSIGNED:
+-            case MN_PUBLIC | MN_WORD:
+-            case MN_PUBLIC | MN_BYTE:
+-            case MN_PUBLIC | MN_WORD | MN_UNSIGNED:
+-            case MN_PUBLIC | MN_BYTE | MN_UNSIGNED:
+-            case MN_PUBLIC | MN_STRING:
+-            case MN_PUBLIC | MN_FLOAT:
+-                *sp++ = ( uint32_t ) int_from_ptr(& PUBDWORD( r, ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            case MN_LOCAL:
+-            case MN_LOCAL | MN_UNSIGNED:
+-            case MN_LOCAL | MN_WORD:
+-            case MN_LOCAL | MN_BYTE:
+-            case MN_LOCAL | MN_WORD | MN_UNSIGNED:
+-            case MN_LOCAL | MN_BYTE | MN_UNSIGNED:
+-            case MN_LOCAL | MN_STRING:
+-            case MN_LOCAL | MN_FLOAT:
+-                *sp++ = ( uint32_t ) int_from_ptr(& LOCDWORD( r, ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            case MN_GLOBAL:
+-            case MN_GLOBAL | MN_UNSIGNED:
+-            case MN_GLOBAL | MN_WORD:
+-            case MN_GLOBAL | MN_BYTE:
+-            case MN_GLOBAL | MN_WORD | MN_UNSIGNED:
+-            case MN_GLOBAL | MN_BYTE | MN_UNSIGNED:
+-            case MN_GLOBAL | MN_STRING:
+-            case MN_GLOBAL | MN_FLOAT:
+-                *sp++ = ( uint32_t ) int_from_ptr(& GLODWORD( ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            case MN_REMOTE:
+-            case MN_REMOTE | MN_UNSIGNED:
+-            case MN_REMOTE | MN_WORD:
+-            case MN_REMOTE | MN_BYTE:
+-            case MN_REMOTE | MN_WORD | MN_UNSIGNED:
+-            case MN_REMOTE | MN_BYTE | MN_UNSIGNED:
+-            case MN_REMOTE | MN_STRING:
+-            case MN_REMOTE | MN_FLOAT:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = ( uint32_t ) int_from_ptr(& LOCDWORD( i, ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            case MN_REMOTE_PUBLIC:
+-            case MN_REMOTE_PUBLIC | MN_UNSIGNED:
+-            case MN_REMOTE_PUBLIC | MN_WORD:
+-            case MN_REMOTE_PUBLIC | MN_BYTE:
+-            case MN_REMOTE_PUBLIC | MN_WORD | MN_UNSIGNED:
+-            case MN_REMOTE_PUBLIC | MN_BYTE | MN_UNSIGNED:
+-            case MN_REMOTE_PUBLIC | MN_STRING:
+-            case MN_REMOTE_PUBLIC | MN_FLOAT:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = ( uint32_t ) int_from_ptr(& PUBDWORD( i, ptr[1] ));
+-                ptr += 2;
+-                break;
+-
+-            /* Access to variables DWORD type */
+-
+-            case MN_GET_PRIV:
+-            case MN_GET_PRIV | MN_FLOAT:
+-            case MN_GET_PRIV | MN_UNSIGNED:
+-                *sp++ = PRIDWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_PUBLIC:
+-            case MN_GET_PUBLIC | MN_FLOAT:
+-            case MN_GET_PUBLIC | MN_UNSIGNED:
+-                *sp++ = PUBDWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_LOCAL:
+-            case MN_GET_LOCAL | MN_FLOAT:
+-            case MN_GET_LOCAL | MN_UNSIGNED:
+-                *sp++ = LOCDWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_GLOBAL:
+-            case MN_GET_GLOBAL | MN_FLOAT:
+-            case MN_GET_GLOBAL | MN_UNSIGNED:
+-                *sp++ = GLODWORD( ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_REMOTE:
+-            case MN_GET_REMOTE | MN_FLOAT:
+-            case MN_GET_REMOTE | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCDWORD( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_REMOTE_PUBLIC:
+-            case MN_GET_REMOTE_PUBLIC | MN_FLOAT:
+-            case MN_GET_REMOTE_PUBLIC | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBDWORD( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_PTR:
+-            case MN_PTR | MN_UNSIGNED:
+-            case MN_PTR | MN_FLOAT:
+-                sp[-1] = *( int32_t * )ptr_from_int(sp[-1]);
+-                ptr++;
+-                break;
+-
+-            /* Access to variables STRING type */
+-
+-            case MN_PUSH | MN_STRING:
+-                *sp++ = ptr[1];
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_PRIV | MN_STRING:
+-                *sp++ = PRIDWORD( r, ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_PUBLIC | MN_STRING:
+-                *sp++ = PUBDWORD( r, ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_LOCAL | MN_STRING:
+-                *sp++ = LOCDWORD( r, ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_GLOBAL | MN_STRING:
+-                *sp++ = GLODWORD( ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_REMOTE | MN_STRING:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCDWORD( i, ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_GET_REMOTE_PUBLIC | MN_STRING:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBDWORD( i, ptr[1] );
+-                string_use( sp[-1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_STRING | MN_PTR:
+-                sp[-1] = *( int32_t * )ptr_from_int(sp[-1]);
+-                string_use( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_STRING | MN_POP:
+-                string_discard( sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Access to variables WORD type */
+-
+-            case MN_WORD | MN_GET_PRIV:
+-                *sp++ = PRIINT16( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_PRIV | MN_UNSIGNED:
+-                *sp++ = PRIWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_PUBLIC:
+-                *sp++ = PUBINT16( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_PUBLIC | MN_UNSIGNED:
+-                *sp++ = PUBWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_LOCAL:
+-                *sp++ = LOCINT16( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_LOCAL | MN_UNSIGNED:
+-                *sp++ = LOCWORD( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_GLOBAL:
+-                *sp++ = GLOINT16( ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_GLOBAL | MN_UNSIGNED:
+-                *sp++ = GLOWORD( ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_REMOTE:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCINT16( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_REMOTE | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCWORD( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_REMOTE_PUBLIC:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBINT16( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBWORD( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_PTR:
+-                sp[-1] = *( int16_t * )ptr_from_int(sp[-1]);
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_PTR | MN_UNSIGNED:
+-                sp[-1] = *( uint16_t * )ptr_from_int(sp[-1]);
+-                ptr++;
+-                break;
+-
+-            /* Access to variables BYTE type */
+-
+-            case MN_BYTE | MN_GET_PRIV:
+-                *sp++ = PRIINT8( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_PRIV | MN_UNSIGNED:
+-                *sp++ = PRIBYTE( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_PUBLIC:
+-                *sp++ = PUBINT8( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_PUBLIC | MN_UNSIGNED:
+-                *sp++ = PUBBYTE( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_LOCAL:
+-                *sp++ = LOCINT8( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_LOCAL | MN_UNSIGNED:
+-                *sp++ = LOCBYTE( r, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_GLOBAL:
+-                *sp++ = GLOINT8( ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_GLOBAL | MN_UNSIGNED:
+-                *sp++ = GLOBYTE( ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_REMOTE:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCINT8( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_REMOTE | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = LOCBYTE( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_REMOTE_PUBLIC:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBINT8( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED:
+-                i = instance_get( sp[-1] );
+-                if ( !i ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
+-                    exit( 0 );
+-                }
+-                sp[-1] = PUBBYTE( i, ptr[1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_PTR:
+-                sp[-1] = *(( int8_t * )ptr_from_int(sp[-1]) );
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_PTR | MN_UNSIGNED:
+-                sp[-1] = *(( uint8_t * )ptr_from_int(sp[-1]) );
+-                ptr++;
+-                break;
+-
+-            /* Floating point math */
+-
+-            case MN_FLOAT | MN_NEG:
+-                *( float * )&sp[-1] = -*(( float * ) & sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_NOT:
+-                *( float * )&sp[-1] = ( float ) !*(( float * ) & sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_ADD:
+-                *( float * )&sp[-2] += *(( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_SUB:
+-                *( float * )&sp[-2] -= *(( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_MUL:
+-                *( float * )&sp[-2] *= *(( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_DIV:
+-                *( float * )&sp[-2] /= *(( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT2INT:
+-                *( int32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t ) * ( float * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2FLOAT:
+-            case MN_INT2FLOAT | MN_UNSIGNED:
+-                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2FLOAT | MN_UNSIGNED | MN_WORD:
+-                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( uint16_t * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2FLOAT | MN_UNSIGNED | MN_BYTE:
+-                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( uint8_t * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2WORD:
+-            case MN_INT2WORD | MN_UNSIGNED:
+-                *( uint32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t )( uint16_t ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2BYTE:
+-            case MN_INT2BYTE | MN_UNSIGNED:
+-                *( uint32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t )( uint8_t ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            /* Mathematical operations */
+-
+-            case MN_NEG:
+-            case MN_NEG | MN_UNSIGNED:
+-                sp[-1] = -sp[-1];
+-                ptr++;
+-                break;
+-
+-            case MN_NOT:
+-            case MN_NOT | MN_UNSIGNED:
+-                sp[-1] = !( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_ADD:
+-                sp[-2] += sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_SUB:
+-                sp[-2] -= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_MUL | MN_WORD:
+-            case MN_MUL | MN_BYTE:
+-            case MN_MUL:
+-                sp[-2] *= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_MUL | MN_WORD | MN_UNSIGNED:
+-            case MN_MUL | MN_BYTE | MN_UNSIGNED:
+-            case MN_MUL | MN_UNSIGNED:
+-                sp[-2] = ( uint32_t )sp[-2] * ( uint32_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_DIV | MN_WORD:
+-            case MN_DIV | MN_BYTE:
+-            case MN_DIV:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp[-2] /= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_DIV | MN_WORD | MN_UNSIGNED:
+-            case MN_DIV | MN_BYTE | MN_UNSIGNED:
+-            case MN_DIV | MN_UNSIGNED:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp[-2] = ( uint32_t )sp[-2] / ( uint32_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_MOD | MN_WORD:
+-            case MN_MOD | MN_BYTE:
+-            case MN_MOD:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp[-2] %= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_MOD | MN_WORD | MN_UNSIGNED:
+-            case MN_MOD | MN_BYTE | MN_UNSIGNED:
+-            case MN_MOD | MN_UNSIGNED:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                sp[-2] = ( uint32_t )sp[-2] % ( uint32_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Bitwise operations */
+-
+-            case MN_ROR:
+-                ( sp[-2] ) = (( int32_t )sp[-2] ) >> sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_ROR | MN_UNSIGNED:
+-                sp[-2] = (( uint32_t ) sp[-2] ) >> sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_ROR:
+-                sp[-2] = (( int16_t ) sp[-2] ) >> sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_ROR | MN_UNSIGNED:
+-                sp[-2] = (( uint16_t ) sp[-2] ) >> sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_ROR:
+-                sp[-2] = (( int8_t ) sp[-2] >> sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_ROR | MN_UNSIGNED:
+-                sp[-2] = (( uint8_t ) sp[-2] ) >> sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_ROL:
+-                ( sp[-2] ) = (( int32_t )sp[-2] ) << sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* All the next ROL operations, don't could be necessaries, but well... */
+-
+-            case MN_ROL | MN_UNSIGNED:
+-                ( sp[-2] ) = ( uint32_t )( sp[-2] << sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_ROL:
+-                ( sp[-2] ) = (( int16_t )sp[-2] ) << sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_ROL | MN_UNSIGNED:
+-                ( sp[-2] ) = ( uint16_t )( sp[-2] << sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_ROL:
+-                ( sp[-2] ) = (( int8_t )sp[-2] ) << sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_ROL | MN_UNSIGNED:
+-                ( sp[-2] ) = ( uint8_t )( sp[-2] << sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BAND:
+-            case MN_BAND | MN_UNSIGNED:
+-                sp[-2] &= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BOR:
+-            case MN_BOR | MN_UNSIGNED:
+-                sp[-2] |= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BXOR:
+-            case MN_BXOR | MN_UNSIGNED:
+-                sp[-2] ^= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BNOT:
+-            case MN_BNOT | MN_UNSIGNED:
+-                sp[-1] = ~( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_BNOT:
+-                sp[-1] = ( int8_t ) ~( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_BNOT | MN_UNSIGNED:
+-                sp[-1] = ( uint8_t ) ~( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_BNOT:
+-                sp[-1] = ( int16_t ) ~( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_BNOT | MN_UNSIGNED:
+-                sp[-1] = ( uint16_t ) ~( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            /* Logical operations */
+-
+-            case MN_AND:
+-                sp[-2] = sp[-2] && sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_OR:
+-                sp[-2] = sp[-2] || sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_XOR:
+-                sp[-2] = ( sp[-2] != 0 ) ^( sp[-1] != 0 );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Comparisons */
+-
+-            case MN_EQ:
+-                sp[-2] = ( sp[-2] == sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_NE:
+-                sp[-2] = ( sp[-2] != sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GTE:
+-                sp[-2] = ( sp[-2] >= sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GTE | MN_UNSIGNED:
+-                sp[-2] = (( uint32_t )sp[-2] >= ( uint32_t )sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LTE:
+-                sp[-2] = ( sp[-2] <= sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LTE | MN_UNSIGNED:
+-                sp[-2] = (( uint32_t )sp[-2] <= ( uint32_t )sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LT:
+-                sp[-2] = ( sp[-2] < sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LT | MN_UNSIGNED:
+-                sp[-2] = (( uint32_t )sp[-2] < ( uint32_t )sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GT:
+-                sp[-2] = ( sp[-2] > sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GT | MN_UNSIGNED:
+-                sp[-2] = (( uint32_t )sp[-2] > ( uint32_t )sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Floating point comparisons */
+-
+-            case MN_EQ | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] == *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_NE | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] != *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GTE | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] >= *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LTE | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] <= *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LT | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] < *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GT | MN_FLOAT:
+-                sp[-2] = ( *( float * ) & sp[-2] > *( float * ) & sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* String comparisons */
+-
+-            case MN_EQ | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) == 0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_NE | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) != 0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GTE | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) >= 0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LTE | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) <= 0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LT | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) <  0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_GT | MN_STRING :
+-                n = string_comp( sp[-2], sp[-1] ) >  0;
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp[-2] = n;
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* String operations */
+-
+-            case MN_VARADD | MN_STRING:
+-                tmp = ptr_from_int( sp[-2] );
+-                n = *( int32_t * )tmp;
+-                *( int32_t * )tmp = string_add( n, sp[-1] );
+-                string_use( *( int32_t * )tmp );
+-                string_discard( n );
+-                string_discard( sp[-1] );
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_LETNP | MN_STRING:
+-                tmp = ptr_from_int( sp[-2] );
+-                string_discard( *( int32_t * )tmp );
+-                ( *( int32_t * )tmp ) = sp[-1];
+-                sp -= 2;
+-                ptr++;
+-                break;
+-
+-            case MN_LET | MN_STRING:
+-                tmp = ptr_from_int( sp[-2] );
+-                string_discard( *( int32_t * )tmp );
+-                ( *( int32_t * )tmp ) = sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_ADD | MN_STRING:
+-                n = string_add( sp[-2], sp[-1] );
+-                string_use( n );
+-                string_discard( sp[-2] );
+-                string_discard( sp[-1] );
+-                sp--;
+-                sp[-1] = n;
+-                ptr++;
+-                break;
+-
+-            case MN_INT2STR:
+-                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2STR | MN_UNSIGNED:
+-                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2STR | MN_WORD:
+-                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2STR | MN_UNSIGNED | MN_WORD:
+-                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2STR | MN_BYTE:
+-                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_INT2STR | MN_UNSIGNED | MN_BYTE:
+-                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_FLOAT2STR:
+-                sp[-ptr[1] - 1] = string_ftoa( *( float * ) & sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_CHR2STR:
+-            {
+-                char buffer[2];
+-                buffer[0] = ( uint8_t )sp[-ptr[1] - 1];
+-                buffer[1] = 0;
+-                sp[-ptr[1] - 1] = string_new( buffer );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-            }
+-
+-            case MN_STRI2CHR:
+-                n = string_char( sp[-2], sp[-1] );
+-                string_discard( sp[-2] );
+-                sp--;
+-                sp[-1] = n;
+-                ptr++;
+-                break;
+-
+-            case MN_STR2CHR:
+-                n = sp[-ptr[1] - 1];
+-                sp[-1] = *string_get( n );
+-                string_discard( n );
+-                ptr += 2;
+-                break;
+-
+-            case MN_POINTER2STR:
+-                // This just seems to convert a pointer to a string, using the offset seems fine
+-                sp[-ptr[1] - 1] = string_ptoa( ( void * ) (size_t)sp[-ptr[1] - 1] );
+-                string_use( sp[-ptr[1] - 1] );
+-                ptr += 2;
+-                break;
+-
+-            case MN_STR2FLOAT:
+-                n = sp[-ptr[1] - 1];
+-                str = ( char * )string_get( n );
+-                *( float * )( &sp[-ptr[1] - 1] ) = str ? ( float )atof( str ) : 0.0f;
+-                string_discard( n );
+-                ptr += 2;
+-                break;
+-
+-            case MN_STR2INT:
+-                n = sp[-ptr[1] - 1];
+-                str = ( char * )string_get( n );
+-                sp[-ptr[1] - 1] = str ? atoi( str ) : 0;
+-                string_discard( n );
+-                ptr += 2;
+-                break;
+-
+-            /* Fixed-length strings operations*/
+-
+-            case MN_A2STR:
+-                str = ( char * )ptr_from_int( sp[-ptr[1] - 1] );
+-                n = string_new( str );
+-                string_use( n );
+-                sp[-ptr[1] - 1] = n;
+-                ptr += 2;
+-                break;
+-
+-            case MN_STR2A:
+-                n = sp[-1];
+-                tmp = ptr_from_int(sp[-2]);
+-                strncpy( ( char * )tmp, string_get( n ), ptr[1] );
+-                (( char * )tmp )[ptr[1]] = 0;
+-                sp[-2] = sp[-1];
+-                sp--;
+-                ptr += 2;
+-                break;
+-
+-            case MN_STRACAT:
+-                n = sp[-1];
+-                tmp = ptr_from_int( sp[-2]);
+-                strncat( ( char * )tmp, string_get( n ), (ptr[1]-1) - strlen( ( char * )tmp ) );
+-                (( char * )tmp )[ptr[1]-1] = 0;
+-                sp[-2] = sp[-1];
+-                sp--;
+-                ptr += 2;
+-                break;
+-
+-            /* Direct operations with variables DWORD type */
+-
+-            case MN_LETNP:
+-            case MN_LETNP | MN_UNSIGNED:
+-                ( *( int32_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp -= 2;
+-                ptr++;
+-                break;
+-
+-            case MN_LET:
+-            case MN_LET | MN_UNSIGNED:
+-                ( *( int32_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_INC:
+-            case MN_INC | MN_UNSIGNED:
+-                ( *( int32_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_DEC:
+-            case MN_DEC | MN_UNSIGNED:
+-                ( *( int32_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_POSTDEC:
+-            case MN_POSTDEC | MN_UNSIGNED:
+-                tmp = ptr_from_int( sp[-1] );
+-                ( *( int32_t * )tmp ) -= ptr[1];
+-                sp[-1] = *( int32_t * )tmp + ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_POSTINC:
+-            case MN_POSTINC | MN_UNSIGNED:
+-                tmp = ptr_from_int( sp[-1] );
+-                *(( int32_t * )tmp ) += ptr[1];
+-                sp[-1] = *( int32_t * )tmp - ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_VARADD:
+-            case MN_VARADD | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) += sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARSUB:
+-            case MN_VARSUB | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) -= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARMUL:
+-            case MN_VARMUL | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) *= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARDIV:
+-            case MN_VARDIV | MN_UNSIGNED:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( int32_t * )ptr_from_int( sp[-2] ) /= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARMOD:
+-            case MN_VARMOD | MN_UNSIGNED:
+-                if ( sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( int32_t * )ptr_from_int( sp[-2] ) %= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VAROR:
+-            case MN_VAROR | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) |= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARXOR:
+-            case MN_VARXOR | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARAND:
+-            case MN_VARAND | MN_UNSIGNED:
+-                *( int32_t * )ptr_from_int( sp[-2] ) &= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARROR:
+-                *( int32_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARROR | MN_UNSIGNED:
+-                *( uint32_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARROL:
+-                *( int32_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_VARROL | MN_UNSIGNED:
+-                *( uint32_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Direct operations with variables WORD type */
+-
+-            case MN_WORD | MN_LETNP:
+-            case MN_WORD | MN_LETNP | MN_UNSIGNED:
+-                ( *( int16_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp -= 2;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_LET:
+-            case MN_WORD | MN_LET | MN_UNSIGNED:
+-                ( *( int16_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_INC:
+-            case MN_WORD | MN_INC | MN_UNSIGNED:
+-                ( *( int16_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_DEC:
+-            case MN_WORD | MN_DEC | MN_UNSIGNED:
+-                ( *( int16_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_POSTDEC:
+-            case MN_WORD | MN_POSTDEC | MN_UNSIGNED:
+-                tmp = ptr_from_int(sp[-1]);
+-                ( *( int16_t * )tmp ) -= ptr[1];
+-                sp[-1] = *( int16_t * )tmp + ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_POSTINC:
+-            case MN_WORD | MN_POSTINC | MN_UNSIGNED:
+-                tmp = ptr_from_int(sp[-1]);
+-                *(( int16_t * )tmp ) += ptr[1];
+-                sp[-1] = *( int16_t * )tmp - ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_WORD | MN_VARADD:
+-            case MN_WORD | MN_VARADD | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) += sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARSUB:
+-            case MN_WORD | MN_VARSUB | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) -= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARMUL:
+-            case MN_WORD | MN_VARMUL | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) *= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARDIV:
+-            case MN_WORD | MN_VARDIV | MN_UNSIGNED:
+-                if (( int16_t )sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( int16_t * )ptr_from_int( sp[-2] ) /= ( int16_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARMOD:
+-            case MN_WORD | MN_VARMOD | MN_UNSIGNED:
+-                if (( int16_t )sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( int16_t * )ptr_from_int( sp[-2] ) %= ( int16_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VAROR:
+-            case MN_WORD | MN_VAROR | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) |= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARXOR:
+-            case MN_WORD | MN_VARXOR | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARAND:
+-            case MN_WORD | MN_VARAND | MN_UNSIGNED:
+-                *( int16_t * )ptr_from_int( sp[-2] ) &= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARROR:
+-                *( int16_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARROR | MN_UNSIGNED:
+-                *( uint16_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARROL:
+-                *( int16_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_WORD | MN_VARROL | MN_UNSIGNED:
+-                *( uint16_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Direct operations with variables BYTE type */
+-
+-            case MN_BYTE | MN_LETNP:
+-            case MN_BYTE | MN_LETNP | MN_UNSIGNED:
+-                ( *( uint8_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp -= 2;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_LET:
+-            case MN_BYTE | MN_LET | MN_UNSIGNED:
+-                ( *( uint8_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_INC:
+-            case MN_BYTE | MN_INC | MN_UNSIGNED:
+-                ( *( uint8_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_DEC:
+-            case MN_BYTE | MN_DEC | MN_UNSIGNED:
+-                ( *( uint8_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_POSTDEC:
+-            case MN_BYTE | MN_POSTDEC | MN_UNSIGNED:
+-                tmp = ptr_from_int(sp[-1]);
+-                ( *( uint8_t * )tmp ) -= ptr[1];
+-                sp[-1] = *( uint8_t * )tmp + ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_POSTINC:
+-            case MN_BYTE | MN_POSTINC | MN_UNSIGNED:
+-                tmp = ptr_from_int(sp[-1]);
+-                *(( uint8_t * )tmp ) += ptr[1];
+-                sp[-1] = *( uint8_t * )tmp - ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_BYTE | MN_VARADD:
+-            case MN_BYTE | MN_VARADD | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) += sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARSUB:
+-            case MN_BYTE | MN_VARSUB | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) -= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARMUL:
+-            case MN_BYTE | MN_VARMUL | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) *= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARDIV:
+-            case MN_BYTE | MN_VARDIV | MN_UNSIGNED:
+-                if (( uint8_t )sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( uint8_t * )ptr_from_int( sp[-2] ) /= ( uint8_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARMOD:
+-            case MN_BYTE | MN_VARMOD | MN_UNSIGNED:
+-                if (( uint8_t )sp[-1] == 0 ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *( uint8_t * )ptr_from_int( sp[-2] ) %= ( uint8_t )sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VAROR:
+-            case MN_BYTE | MN_VAROR | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) |= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARXOR:
+-            case MN_BYTE | MN_VARXOR | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARAND:
+-            case MN_BYTE | MN_VARAND | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) &= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARROR:
+-                *( int8_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARROR | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARROL:
+-                *( int8_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_BYTE | MN_VARROL | MN_UNSIGNED:
+-                *( uint8_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Direct operations with variables FLOAT type */
+-
+-            case MN_FLOAT | MN_LETNP:
+-                ( *( float * )ptr_from_int( sp[-2] ) ) = *( float * ) & sp[-1];
+-                sp -= 2;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_LET :
+-                ( *( float * )ptr_from_int( sp[-2] ) ) = *( float * ) & sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_INC:
+-                ( *( float * )ptr_from_int( sp[-1] ) ) += ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_FLOAT | MN_DEC:
+-                ( *( float * )ptr_from_int( sp[-1] ) ) -= ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_FLOAT | MN_POSTDEC:
+-                tmp = ptr_from_int(sp[-1]);
+-                ( *( float * )tmp ) -= ptr[1];
+-                sp[-1] = *( uint32_t * )tmp + ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_FLOAT | MN_POSTINC:
+-                tmp = ptr_from_int(sp[-1]);
+-                *(( float * )tmp ) += ptr[1];
+-                sp[-1] = *( uint32_t * )tmp - ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_FLOAT | MN_VARADD:
+-                *( float * )ptr_from_int( sp[-2] ) += *( float * ) & sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_VARSUB:
+-                *( float * )ptr_from_int( sp[-2] ) -= *( float * ) & sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_VARMUL:
+-                *( float * )ptr_from_int( sp[-2] ) *= *( float * ) & sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            case MN_FLOAT | MN_VARDIV:
+-                *( float * )ptr_from_int( sp[-2] ) /= *( float * ) & sp[-1];
+-                sp--;
+-                ptr++;
+-                break;
+-
+-            /* Jumps */
+-
+-            case MN_JUMP:
+-                ptr = r->code + ptr[1];
+-                continue;
+-
+-            case MN_JTRUE:
+-                sp--;
+-                if ( *sp ) {
+-                    ptr = r->code + ptr[1];
+-                    continue;
+-                }
+-                ptr += 2;
+-                break;
+-
+-            case MN_JFALSE:
+-                sp--;
+-                if ( !*sp ) {
+-                    ptr = r->code + ptr[1];
+-                    continue;
+-                }
+-                ptr += 2;
+-                break;
+-
+-            case MN_JTTRUE:
+-                if ( sp[-1] ) {
+-                    ptr = r->code + ptr[1];
+-                    continue;
+-                }
+-                ptr += 2;
+-                break;
+-
+-            case MN_JTFALSE:
+-                if ( !sp[-1] ) {
+-                    ptr = r->code + ptr[1];
+-                    continue;
+-                }
+-                ptr += 2;
+-                break;
+-
+-            case MN_NCALL:
+-                *sp++ = ptr - r->code + 2 ; /* Push next address */
+-                ptr = r->code + ptr[1] ; /* Call function */
+-                r->call_level++;
+-                break;
+-
+-            /* Switch */
+-
+-            case MN_SWITCH:
+-                r->switchval = *--sp;
+-                r->cased = 0;
+-                ptr++;
+-                break;
+-
+-            case MN_SWITCH | MN_STRING:
+-                if ( r->switchval_string != 0 ) string_discard( r->switchval_string );
+-                r->switchval_string = *--sp;
+-                r->cased = 0;
+-                ptr++;
+-                break;
+-
+-            case MN_CASE:
+-                if ( r->switchval == *--sp ) r->cased = 2;
+-                ptr++;
+-                break;
+-
+-            case MN_CASE | MN_STRING:
+-                if ( string_comp( r->switchval_string, *--sp ) == 0 ) r->cased = 2;
+-                string_discard( *sp );
+-                string_discard( sp[-1] );
+-                ptr++;
+-                break;
+-
+-            case MN_CASE_R:
+-                sp -= 2;
+-                if ( r->switchval >= sp[0] && r->switchval <= sp[1] ) r->cased = 1;
+-                ptr++;
+-                break;
+-
+-            case MN_CASE_R | MN_STRING:
+-                sp -= 2;
+-                if ( string_comp( r->switchval_string, sp[0] ) >= 0 &&
+-                     string_comp( r->switchval_string, sp[1] ) <= 0 )
+-                    r->cased = 1;
+-                string_discard( sp[0] );
+-                string_discard( sp[1] );
+-                ptr++;
+-                break;
+-
+-            case MN_JNOCASE:
+-                if ( r->cased < 1 ) {
+-                    ptr = r->code + ptr[1];
+-                    continue;
+-                }
+-                ptr += 2;
+-                break;
+-
+-            /* Process control */
+-
+-            case MN_TYPE:
+-            {
+-                PROCDEF * proct = procdef_get( ptr[1] );
+-                if ( !proct ) {
+-                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Invalid type\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    exit( 0 );
+-                }
+-                *sp++ = proct->type;
+-                ptr += 2;
+-                break;
+-            }
+-
+-            case MN_FRAME:
+-                LOCINT32( r, FRAME_PERCENT ) += sp[-1];
+-
+-                sp--;
+-                r->codeptr = ptr + 1;
+-                return_value = LOCDWORD( r, PROCESS_ID );
+-
+-                if ( !( r->proc->flags & PROC_FUNCTION ) &&
+-                        r->called_by && instance_exists( r->called_by ) && ( LOCDWORD( r->called_by, STATUS ) & STATUS_WAITING_MASK ) ) {
+-                    /* We're returning and the parent is waiting: wake it up */
+-                    if ( r->called_by->stack && ( r->called_by->stack[0] & STACK_RETURN_VALUE ) )
+-                        r->called_by->stack_ptr[-1] = return_value;
+-
+-                    LOCDWORD( r->called_by, STATUS ) &= ~STATUS_WAITING_MASK;
+-                    r->called_by = NULL;
+-                }
+-                goto break_all;
+-
+-            case MN_END:
+-                if ( r->call_level > 0 ) {
+-                    ptr = r->code + *--sp;
+-                    r->call_level--;
+-                    continue;
+-                }
+-
+-                if ( LOCDWORD( r, STATUS ) != STATUS_DEAD ) LOCDWORD( r, STATUS ) = STATUS_KILLED;
+-                goto break_all;
+-
+-            case MN_RETURN:
+-                if ( r->call_level > 0 ) {
+-                    ptr = r->code + *--sp;
+-                    r->call_level--;
+-                    continue;
+-                }
+-
+-                if ( LOCDWORD( r, STATUS ) != STATUS_DEAD ) LOCDWORD( r, STATUS ) = STATUS_KILLED;
+-                sp--;
+-                return_value = *sp;
+-                goto break_all;
+-
+-            /* Handlers */
+-
+-            case MN_EXITHNDLR:
+-                r->exitcode = ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            case MN_ERRHNDLR:
+-                r->errorcode = ptr[1];
+-                ptr += 2;
+-                break;
+-
+-            /* Others */
+-
+-            case MN_DEBUG:
+-                if ( dcb.data.NSourceFiles ) {
+-                    if ( debug > 0 ) printf( "\n::: DEBUG from %s(%d)\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
+-                    trace_sentence = -1;
+-                    debugger_show_console = 1;
+-                }
+-                ptr++;
+-                break;
+-
+-            case MN_SENTENCE:
+-                trace_sentence = ptr[1];
+-                trace_instance = r;
+-                ptr += 2;
+-                if ( debugger_trace || debugger_step ) {
+-                    debugger_trace = 0;
+-                    debugger_step = 0;
+-                    debugger_show_console = 1;
+-                }
+-                break;
+-
+-            default:
+-                fprintf( stderr, "ERROR: Runtime error in %s(%d) - Mnemonic 0x%02X not implemented\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), *ptr );
+-                exit( 0 );
+-        }
+-
+-        if ( sp < stack_base ) {
+-            fprintf( stderr, "ERROR: Runtime error in %s(%d) - Critical Stack Problem StackBase=%p StackPTR=%p\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), (void *)r->stack, (void *)sp );
+-            exit( 0 );
+-        }
+-
+-#ifdef EXIT_ON_EMPTY_STACK
+-        if ( sp == r->stack ) {
+-            r->codeptr = ptr;
+-            if ( LOCDWORD( r, STATUS ) != STATUS_RUNNING && LOCDWORD( r, STATUS ) != STATUS_DEAD ) break;
+-        }
+-#endif
+-    }
+-
+-    /* *** GENERAL EXIT *** */
+-break_all:
+-    r->stack_ptr = sp;
+-
+-    if ( !*ptr || *ptr == MN_RETURN || *ptr == MN_END || LOCDWORD( r, STATUS ) == STATUS_KILLED ) {
+-        /* Check for waiting parent */
+-        if ( r->called_by && instance_exists( r->called_by ) && ( LOCDWORD( r->called_by, STATUS ) & STATUS_WAITING_MASK ) ) {
+-            /* We're returning and the parent is waiting: wake it up */
+-            if ( r->called_by->stack && ( r->called_by->stack[0] & STACK_RETURN_VALUE ) )
+-                r->called_by->stack_ptr[-1] = return_value;
+-
+-            LOCDWORD( r->called_by, STATUS ) &= ~STATUS_WAITING_MASK;
+-        }
+-
+-        r->called_by = NULL;
+-
+-        /* The process should be destroyed immediately, it is a function-type one */
+-        /* Run ONEXIT */
+-        if (( LOCDWORD( r, STATUS ) & ~STATUS_WAITING_MASK ) != STATUS_DEAD && r->exitcode ) {
+-            LOCDWORD( r, STATUS ) = STATUS_DEAD;
+-            r->codeptr = r->code + r->exitcode;
+-            ptr = r->codeptr;
+-            goto main_loop_instance_go;
+-//            instance_go( r );
+-//            if ( !instance_exists( r ) ) r = NULL;
+-        } else {
+-            instance_destroy( r );
+-            r = NULL;
+-        }
+-    }
+-
+-    /* Hook */
+-    if ( r && instance_pos_execute_hook_count ) {
+-        for ( n = 0; n < instance_pos_execute_hook_count; n++ )
+-            instance_pos_execute_hook_list[n]( r );
+-    }
+-    /* Hook */
+-
+-    if ( r && LOCDWORD( r, STATUS ) != STATUS_KILLED && r->first_run ) r->first_run = 0;
+-
+-    return return_value;
+-}
+-
+-/* ---------------------------------------------------------------------- */
++/*
++ *  Copyright © 2006-2019 SplinterGU (Fenix/Bennugd)
++ *  Copyright © 2002-2006 Fenix Team (Fenix)
++ *  Copyright © 1999-2002 José Luis Cebrián Pagüe (Fenix)
++ *
++ *  This file is part of Bennu - Game Development
++ *
++ *  This software is provided 'as-is', without any express or implied
++ *  warranty. In no event will the authors be held liable for any damages
++ *  arising from the use of this software.
++ *
++ *  Permission is granted to anyone to use this software for any purpose,
++ *  including commercial applications, and to alter it and redistribute it
++ *  freely, subject to the following restrictions:
++ *
++ *     1. The origin of this software must not be misrepresented; you must not
++ *     claim that you wrote the original software. If you use this software
++ *     in a product, an acknowledgment in the product documentation would be
++ *     appreciated but is not required.
++ *
++ *     2. Altered source versions must be plainly marked as such, and must not be
++ *     misrepresented as being the original software.
++ *
++ *     3. This notice may not be removed or altered from any source
++ *     distribution.
++ *
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include "bgdrtm.h"
++#include "dcb.h"
++
++#include "sysprocs_p.h"
++#include "pslang.h"
++#include "instance.h"
++#include "offsets.h"
++#include "xstrings.h"
++
++#include <assert.h>
++
++/* Direct-threaded dispatch: every opcode ends with its own indirect jump
++   through op_table instead of looping back to one shared switch jump, so
++   the branch predictor gets one entry per opcode (Cortex-A9, 2026-10-03).
++   THREADED_DISPATCH=0 builds the plain switch from the same source. */
++#ifndef THREADED_DISPATCH
++#if LIBRETRO_CORE && defined( __GNUC__ )
++#define THREADED_DISPATCH 1
++#else
++#define THREADED_DISPATCH 0
++#endif
++#endif
++
++#if THREADED_DISPATCH
++/* The slow paths are table entries picked with selects, not branches, so
++   that each dispatch is one straight block ending in the indirect jump:
++   LLVM merges the 359 copies into one and only tail-duplicates it back
++   into every opcode when it is a single block (plus -tail-dup-pred-size
++   and -tail-dup-succ-size raised past their default 16, see
++   hps/CMakeLists.txt). */
++#define OP_SLOW_CONTINUE 0x1000  /* check set: back to the loop head */
++#define OP_SLOW_NEXT     0x1001  /* stack check, then the loop head */
++#define OP_UNKNOWN       0x1002  /* out of range: default */
++#define OP_TABLE_SIZE    0x1003
++#define OPLABEL(name)   name:
++#define DISPATCH_IF(slow, slow_op) do { \
++            unsigned op_ = (unsigned)*ptr; \
++            op_ = op_ < OP_SLOW_CONTINUE ? op_ : OP_UNKNOWN; \
++            op_ = ( slow ) ? ( slow_op ) : op_; \
++            goto *op_table[op_]; \
++        } while ( 0 )
++#define DISPATCH()      DISPATCH_IF( 0, 0 )
++/* end of an opcode that skipped the stack check (the old `continue`) */
++#define CONTINUE        DISPATCH_IF( check, OP_SLOW_CONTINUE )
++/* end of an opcode (the old `break`): stack check, then straight to the next one */
++#define NEXT            DISPATCH_IF( check | ( sp < stack_base ), OP_SLOW_NEXT )
++#else
++#define OPLABEL(name)
++#define CONTINUE        continue
++#define NEXT            break
++#endif
++
++/* ---------------------------------------------------------------------- */
++/* Interpreter's main module                                              */
++/* ---------------------------------------------------------------------- */
++
++int exit_value = 0;
++int must_exit = 0;
++
++int frame_completed = 0;
++
++int trace_sentence  = -1;
++INSTANCE * trace_instance = NULL;
++
++int debugger_show_console       = 0; // debuggin
++int debugger_trace              = 0; // 1 single sentence
++int debugger_step               = 0; // execute 1 sentence or 1 procedure or 1 function as an unit
++
++/* ---------------------------------------------------------------------- */
++
++// static int go_to_next_instance = 0;
++
++/* ---------------------------------------------------------------------- */
++
++static int stack_dump( INSTANCE * r ) {
++    register int * ptr = &r->stack[1];
++    register int i = 0;
++
++    while ( ptr < r->stack_ptr ) {
++        if ( i == 5 ) {
++            i = 0;
++            printf( "\n" );
++        }
++        printf( "%08X ", *ptr++ );
++        i++;
++    }
++
++    return i;
++}
++
++/* ---------------------------------------------------------------------- */
++
++int instance_go_all() {
++
++    INSTANCE * i = NULL;
++    int n, status, i_count;
++
++    must_exit = 0;
++
++    while ( first_instance ) {
++        frame_completed = 0;
++
++        // Reset iterator by priority
++        instance_reset_iterator_by_priority(); // Don't must be neccessary
++        i = instance_next_by_priority();
++
++        i_count = 0;
++        while ( i ) {
++            if ( LOCINT32( i, FRAME_PERCENT ) < 100 ) {
++                status = LOCDWORD( i, STATUS );
++                if ( status == STATUS_RUNNING ) {
++                    /* Run instance */
++                    /* Hook */
++                    if ( process_exec_hook_count )
++                        for ( n = 0; n < process_exec_hook_count; n++ )
++                            process_exec_hook_list[n]( i );
++                    /* Hook */
++                } else if ( status != STATUS_KILLED && status != STATUS_DEAD ) { /* STATUS_SLEEPING OR STATUS_FROZEN OR STATUS_WAITING_MASK */
++                    i = instance_next_by_priority();
++                    continue;
++                }
++                /* If instance is KILLED or DEAD, run instance without exec_hook executed. */
++
++                instance_go( i );
++
++                i_count++;
++
++                if ( must_exit ) goto instance_go_all_exit;
++
++            }
++
++            i = instance_next_by_priority();
++        }
++
++        /* If frame is complete, then update internal vars and execute main hooks. */
++
++        if ( !i_count ) {
++            frame_completed = 1;
++            /* Honors the signal-changed status of the process and
++             * saves so it is used in this loop the next frame
++             */
++            i = first_instance;
++            while ( i ) {
++                status = LOCDWORD( i, SAVED_STATUS ) = LOCDWORD( i, STATUS );
++                // if status == STATUS_KILLED or STATUS_DEAD then the process still lives
++                if ( status == STATUS_DEAD || status == STATUS_KILLED || status == STATUS_RUNNING ) LOCINT32( i, FRAME_PERCENT ) -= 100;
++
++                if ( i->last_priority != LOCINT32( i, PRIORITY ) ) {
++                    instance_dirty( i );
++                    LOCINT32( i, SAVED_PRIORITY ) = LOCINT32( i, PRIORITY );
++                }
++
++                i = i->next;
++            }
++
++            if ( !first_instance ) break;
++
++            /* Hook */
++            if ( handler_hook_count )
++                for ( n = 0; n < handler_hook_count; n++ )
++                    handler_hook_list[n].hook();
++            /* Hook */
++
++            continue;
++        }
++    }
++
++instance_go_all_exit:
++
++    return exit_value;
++
++}
++
++/* ---------------------------------------------------------------------- */
++
++int instance_go( INSTANCE * r ) {
++
++    if ( !r ) return 0;
++
++    register int * ptr = r->codeptr;
++    int * sp;                       /* r->stack_ptr, kept in a register across the loop and written back (r->stack_ptr = sp) before anything outside the loop may look at it */
++    int * stack_base;
++    uint32_t * status_p;            /* &LOCDWORD( r, STATUS ) */
++    int check;                      /* re-read must_exit and the status: only the opcodes that run outside code can change them */
++
++    int n, return_value = LOCDWORD( r, PROCESS_ID );
++    SYSPROC * p = NULL;
++    INSTANCE * i = NULL;
++    char * str = NULL;
++    int status;
++    void* tmp;
++
++    /* Pointer to the current process's code (it may be a called one) */
++
++    int child_is_alive = 0;
++
++    int debugger_step_pending = 0; // local to instance
++
++#if THREADED_DISPATCH
++    /* Opcode -> handler. Values are the mnemonic | type | params bits, all
++       below 0x1000; the gaps go to default (unknown opcode, runtime error).
++       Three extra entries past the opcodes, see OP_SLOW_CONTINUE. */
++#pragma clang diagnostic push
++#pragma clang diagnostic ignored "-Winitializer-overrides"
++    static const void * const op_table[OP_TABLE_SIZE] = {
++        [0 ... OP_TABLE_SIZE - 1] = &&op_default,
++        [OP_SLOW_CONTINUE] = &&op_slow_continue,
++        [OP_SLOW_NEXT] = &&op_slow_next,
++        [MN_NOP] = &&op_NOP,
++        [MN_DUP] = &&op_DUP,
++        [MN_PUSH] = &&op_PUSH,
++        [MN_POP] = &&op_POP,
++        [MN_INDEX] = &&op_INDEX,
++        [MN_INDEX | MN_UNSIGNED] = &&op_INDEX_UNSIGNED,
++        [MN_INDEX | MN_STRING] = &&op_INDEX_STRING,
++        [MN_INDEX | MN_WORD] = &&op_INDEX_WORD,
++        [MN_INDEX | MN_WORD | MN_UNSIGNED] = &&op_INDEX_WORD_UNSIGNED,
++        [MN_INDEX | MN_BYTE] = &&op_INDEX_BYTE,
++        [MN_INDEX | MN_BYTE | MN_UNSIGNED] = &&op_INDEX_BYTE_UNSIGNED,
++        [MN_INDEX | MN_FLOAT] = &&op_INDEX_FLOAT,
++        [MN_ARRAY] = &&op_ARRAY,
++        [MN_CLONE] = &&op_CLONE,
++        [MN_CALL] = &&op_CALL,
++        [MN_PROC] = &&op_PROC,
++        [MN_SYSCALL] = &&op_SYSCALL,
++        [MN_SYSPROC] = &&op_SYSPROC,
++        [MN_PRIVATE] = &&op_PRIVATE,
++        [MN_PRIVATE | MN_UNSIGNED] = &&op_PRIVATE_UNSIGNED,
++        [MN_PRIVATE | MN_WORD] = &&op_PRIVATE_WORD,
++        [MN_PRIVATE | MN_BYTE] = &&op_PRIVATE_BYTE,
++        [MN_PRIVATE | MN_WORD | MN_UNSIGNED] = &&op_PRIVATE_WORD_UNSIGNED,
++        [MN_PRIVATE | MN_BYTE | MN_UNSIGNED] = &&op_PRIVATE_BYTE_UNSIGNED,
++        [MN_PRIVATE | MN_STRING] = &&op_PRIVATE_STRING,
++        [MN_PRIVATE | MN_FLOAT] = &&op_PRIVATE_FLOAT,
++        [MN_PUBLIC] = &&op_PUBLIC,
++        [MN_PUBLIC | MN_UNSIGNED] = &&op_PUBLIC_UNSIGNED,
++        [MN_PUBLIC | MN_WORD] = &&op_PUBLIC_WORD,
++        [MN_PUBLIC | MN_BYTE] = &&op_PUBLIC_BYTE,
++        [MN_PUBLIC | MN_WORD | MN_UNSIGNED] = &&op_PUBLIC_WORD_UNSIGNED,
++        [MN_PUBLIC | MN_BYTE | MN_UNSIGNED] = &&op_PUBLIC_BYTE_UNSIGNED,
++        [MN_PUBLIC | MN_STRING] = &&op_PUBLIC_STRING,
++        [MN_PUBLIC | MN_FLOAT] = &&op_PUBLIC_FLOAT,
++        [MN_LOCAL] = &&op_LOCAL,
++        [MN_LOCAL | MN_UNSIGNED] = &&op_LOCAL_UNSIGNED,
++        [MN_LOCAL | MN_WORD] = &&op_LOCAL_WORD,
++        [MN_LOCAL | MN_BYTE] = &&op_LOCAL_BYTE,
++        [MN_LOCAL | MN_WORD | MN_UNSIGNED] = &&op_LOCAL_WORD_UNSIGNED,
++        [MN_LOCAL | MN_BYTE | MN_UNSIGNED] = &&op_LOCAL_BYTE_UNSIGNED,
++        [MN_LOCAL | MN_STRING] = &&op_LOCAL_STRING,
++        [MN_LOCAL | MN_FLOAT] = &&op_LOCAL_FLOAT,
++        [MN_GLOBAL] = &&op_GLOBAL,
++        [MN_GLOBAL | MN_UNSIGNED] = &&op_GLOBAL_UNSIGNED,
++        [MN_GLOBAL | MN_WORD] = &&op_GLOBAL_WORD,
++        [MN_GLOBAL | MN_BYTE] = &&op_GLOBAL_BYTE,
++        [MN_GLOBAL | MN_WORD | MN_UNSIGNED] = &&op_GLOBAL_WORD_UNSIGNED,
++        [MN_GLOBAL | MN_BYTE | MN_UNSIGNED] = &&op_GLOBAL_BYTE_UNSIGNED,
++        [MN_GLOBAL | MN_STRING] = &&op_GLOBAL_STRING,
++        [MN_GLOBAL | MN_FLOAT] = &&op_GLOBAL_FLOAT,
++        [MN_REMOTE] = &&op_REMOTE,
++        [MN_REMOTE | MN_UNSIGNED] = &&op_REMOTE_UNSIGNED,
++        [MN_REMOTE | MN_WORD] = &&op_REMOTE_WORD,
++        [MN_REMOTE | MN_BYTE] = &&op_REMOTE_BYTE,
++        [MN_REMOTE | MN_WORD | MN_UNSIGNED] = &&op_REMOTE_WORD_UNSIGNED,
++        [MN_REMOTE | MN_BYTE | MN_UNSIGNED] = &&op_REMOTE_BYTE_UNSIGNED,
++        [MN_REMOTE | MN_STRING] = &&op_REMOTE_STRING,
++        [MN_REMOTE | MN_FLOAT] = &&op_REMOTE_FLOAT,
++        [MN_REMOTE_PUBLIC] = &&op_REMOTE_PUBLIC,
++        [MN_REMOTE_PUBLIC | MN_UNSIGNED] = &&op_REMOTE_PUBLIC_UNSIGNED,
++        [MN_REMOTE_PUBLIC | MN_WORD] = &&op_REMOTE_PUBLIC_WORD,
++        [MN_REMOTE_PUBLIC | MN_BYTE] = &&op_REMOTE_PUBLIC_BYTE,
++        [MN_REMOTE_PUBLIC | MN_WORD | MN_UNSIGNED] = &&op_REMOTE_PUBLIC_WORD_UNSIGNED,
++        [MN_REMOTE_PUBLIC | MN_BYTE | MN_UNSIGNED] = &&op_REMOTE_PUBLIC_BYTE_UNSIGNED,
++        [MN_REMOTE_PUBLIC | MN_STRING] = &&op_REMOTE_PUBLIC_STRING,
++        [MN_REMOTE_PUBLIC | MN_FLOAT] = &&op_REMOTE_PUBLIC_FLOAT,
++        [MN_GET_PRIV] = &&op_GET_PRIV,
++        [MN_GET_PRIV | MN_FLOAT] = &&op_GET_PRIV_FLOAT,
++        [MN_GET_PRIV | MN_UNSIGNED] = &&op_GET_PRIV_UNSIGNED,
++        [MN_GET_PUBLIC] = &&op_GET_PUBLIC,
++        [MN_GET_PUBLIC | MN_FLOAT] = &&op_GET_PUBLIC_FLOAT,
++        [MN_GET_PUBLIC | MN_UNSIGNED] = &&op_GET_PUBLIC_UNSIGNED,
++        [MN_GET_LOCAL] = &&op_GET_LOCAL,
++        [MN_GET_LOCAL | MN_FLOAT] = &&op_GET_LOCAL_FLOAT,
++        [MN_GET_LOCAL | MN_UNSIGNED] = &&op_GET_LOCAL_UNSIGNED,
++        [MN_GET_GLOBAL] = &&op_GET_GLOBAL,
++        [MN_GET_GLOBAL | MN_FLOAT] = &&op_GET_GLOBAL_FLOAT,
++        [MN_GET_GLOBAL | MN_UNSIGNED] = &&op_GET_GLOBAL_UNSIGNED,
++        [MN_GET_REMOTE] = &&op_GET_REMOTE,
++        [MN_GET_REMOTE | MN_FLOAT] = &&op_GET_REMOTE_FLOAT,
++        [MN_GET_REMOTE | MN_UNSIGNED] = &&op_GET_REMOTE_UNSIGNED,
++        [MN_GET_REMOTE_PUBLIC] = &&op_GET_REMOTE_PUBLIC,
++        [MN_GET_REMOTE_PUBLIC | MN_FLOAT] = &&op_GET_REMOTE_PUBLIC_FLOAT,
++        [MN_GET_REMOTE_PUBLIC | MN_UNSIGNED] = &&op_GET_REMOTE_PUBLIC_UNSIGNED,
++        [MN_PTR] = &&op_PTR,
++        [MN_PTR | MN_UNSIGNED] = &&op_PTR_UNSIGNED,
++        [MN_PTR | MN_FLOAT] = &&op_PTR_FLOAT,
++        [MN_PUSH | MN_STRING] = &&op_PUSH_STRING,
++        [MN_GET_PRIV | MN_STRING] = &&op_GET_PRIV_STRING,
++        [MN_GET_PUBLIC | MN_STRING] = &&op_GET_PUBLIC_STRING,
++        [MN_GET_LOCAL | MN_STRING] = &&op_GET_LOCAL_STRING,
++        [MN_GET_GLOBAL | MN_STRING] = &&op_GET_GLOBAL_STRING,
++        [MN_GET_REMOTE | MN_STRING] = &&op_GET_REMOTE_STRING,
++        [MN_GET_REMOTE_PUBLIC | MN_STRING] = &&op_GET_REMOTE_PUBLIC_STRING,
++        [MN_STRING | MN_PTR] = &&op_STRING_PTR,
++        [MN_STRING | MN_POP] = &&op_STRING_POP,
++        [MN_WORD | MN_GET_PRIV] = &&op_WORD_GET_PRIV,
++        [MN_WORD | MN_GET_PRIV | MN_UNSIGNED] = &&op_WORD_GET_PRIV_UNSIGNED,
++        [MN_WORD | MN_GET_PUBLIC] = &&op_WORD_GET_PUBLIC,
++        [MN_WORD | MN_GET_PUBLIC | MN_UNSIGNED] = &&op_WORD_GET_PUBLIC_UNSIGNED,
++        [MN_WORD | MN_GET_LOCAL] = &&op_WORD_GET_LOCAL,
++        [MN_WORD | MN_GET_LOCAL | MN_UNSIGNED] = &&op_WORD_GET_LOCAL_UNSIGNED,
++        [MN_WORD | MN_GET_GLOBAL] = &&op_WORD_GET_GLOBAL,
++        [MN_WORD | MN_GET_GLOBAL | MN_UNSIGNED] = &&op_WORD_GET_GLOBAL_UNSIGNED,
++        [MN_WORD | MN_GET_REMOTE] = &&op_WORD_GET_REMOTE,
++        [MN_WORD | MN_GET_REMOTE | MN_UNSIGNED] = &&op_WORD_GET_REMOTE_UNSIGNED,
++        [MN_WORD | MN_GET_REMOTE_PUBLIC] = &&op_WORD_GET_REMOTE_PUBLIC,
++        [MN_WORD | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED] = &&op_WORD_GET_REMOTE_PUBLIC_UNSIGNED,
++        [MN_WORD | MN_PTR] = &&op_WORD_PTR,
++        [MN_WORD | MN_PTR | MN_UNSIGNED] = &&op_WORD_PTR_UNSIGNED,
++        [MN_BYTE | MN_GET_PRIV] = &&op_BYTE_GET_PRIV,
++        [MN_BYTE | MN_GET_PRIV | MN_UNSIGNED] = &&op_BYTE_GET_PRIV_UNSIGNED,
++        [MN_BYTE | MN_GET_PUBLIC] = &&op_BYTE_GET_PUBLIC,
++        [MN_BYTE | MN_GET_PUBLIC | MN_UNSIGNED] = &&op_BYTE_GET_PUBLIC_UNSIGNED,
++        [MN_BYTE | MN_GET_LOCAL] = &&op_BYTE_GET_LOCAL,
++        [MN_BYTE | MN_GET_LOCAL | MN_UNSIGNED] = &&op_BYTE_GET_LOCAL_UNSIGNED,
++        [MN_BYTE | MN_GET_GLOBAL] = &&op_BYTE_GET_GLOBAL,
++        [MN_BYTE | MN_GET_GLOBAL | MN_UNSIGNED] = &&op_BYTE_GET_GLOBAL_UNSIGNED,
++        [MN_BYTE | MN_GET_REMOTE] = &&op_BYTE_GET_REMOTE,
++        [MN_BYTE | MN_GET_REMOTE | MN_UNSIGNED] = &&op_BYTE_GET_REMOTE_UNSIGNED,
++        [MN_BYTE | MN_GET_REMOTE_PUBLIC] = &&op_BYTE_GET_REMOTE_PUBLIC,
++        [MN_BYTE | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED] = &&op_BYTE_GET_REMOTE_PUBLIC_UNSIGNED,
++        [MN_BYTE | MN_PTR] = &&op_BYTE_PTR,
++        [MN_BYTE | MN_PTR | MN_UNSIGNED] = &&op_BYTE_PTR_UNSIGNED,
++        [MN_FLOAT | MN_NEG] = &&op_FLOAT_NEG,
++        [MN_FLOAT | MN_NOT] = &&op_FLOAT_NOT,
++        [MN_FLOAT | MN_ADD] = &&op_FLOAT_ADD,
++        [MN_FLOAT | MN_SUB] = &&op_FLOAT_SUB,
++        [MN_FLOAT | MN_MUL] = &&op_FLOAT_MUL,
++        [MN_FLOAT | MN_DIV] = &&op_FLOAT_DIV,
++        [MN_FLOAT2INT] = &&op_FLOAT2INT,
++        [MN_INT2FLOAT] = &&op_INT2FLOAT,
++        [MN_INT2FLOAT | MN_UNSIGNED] = &&op_INT2FLOAT_UNSIGNED,
++        [MN_INT2FLOAT | MN_UNSIGNED | MN_WORD] = &&op_INT2FLOAT_UNSIGNED_WORD,
++        [MN_INT2FLOAT | MN_UNSIGNED | MN_BYTE] = &&op_INT2FLOAT_UNSIGNED_BYTE,
++        [MN_INT2WORD] = &&op_INT2WORD,
++        [MN_INT2WORD | MN_UNSIGNED] = &&op_INT2WORD_UNSIGNED,
++        [MN_INT2BYTE] = &&op_INT2BYTE,
++        [MN_INT2BYTE | MN_UNSIGNED] = &&op_INT2BYTE_UNSIGNED,
++        [MN_NEG] = &&op_NEG,
++        [MN_NEG | MN_UNSIGNED] = &&op_NEG_UNSIGNED,
++        [MN_NOT] = &&op_NOT,
++        [MN_NOT | MN_UNSIGNED] = &&op_NOT_UNSIGNED,
++        [MN_ADD] = &&op_ADD,
++        [MN_SUB] = &&op_SUB,
++        [MN_MUL | MN_WORD] = &&op_MUL_WORD,
++        [MN_MUL | MN_BYTE] = &&op_MUL_BYTE,
++        [MN_MUL] = &&op_MUL,
++        [MN_MUL | MN_WORD | MN_UNSIGNED] = &&op_MUL_WORD_UNSIGNED,
++        [MN_MUL | MN_BYTE | MN_UNSIGNED] = &&op_MUL_BYTE_UNSIGNED,
++        [MN_MUL | MN_UNSIGNED] = &&op_MUL_UNSIGNED,
++        [MN_DIV | MN_WORD] = &&op_DIV_WORD,
++        [MN_DIV | MN_BYTE] = &&op_DIV_BYTE,
++        [MN_DIV] = &&op_DIV,
++        [MN_DIV | MN_WORD | MN_UNSIGNED] = &&op_DIV_WORD_UNSIGNED,
++        [MN_DIV | MN_BYTE | MN_UNSIGNED] = &&op_DIV_BYTE_UNSIGNED,
++        [MN_DIV | MN_UNSIGNED] = &&op_DIV_UNSIGNED,
++        [MN_MOD | MN_WORD] = &&op_MOD_WORD,
++        [MN_MOD | MN_BYTE] = &&op_MOD_BYTE,
++        [MN_MOD] = &&op_MOD,
++        [MN_MOD | MN_WORD | MN_UNSIGNED] = &&op_MOD_WORD_UNSIGNED,
++        [MN_MOD | MN_BYTE | MN_UNSIGNED] = &&op_MOD_BYTE_UNSIGNED,
++        [MN_MOD | MN_UNSIGNED] = &&op_MOD_UNSIGNED,
++        [MN_ROR] = &&op_ROR,
++        [MN_ROR | MN_UNSIGNED] = &&op_ROR_UNSIGNED,
++        [MN_WORD | MN_ROR] = &&op_WORD_ROR,
++        [MN_WORD | MN_ROR | MN_UNSIGNED] = &&op_WORD_ROR_UNSIGNED,
++        [MN_BYTE | MN_ROR] = &&op_BYTE_ROR,
++        [MN_BYTE | MN_ROR | MN_UNSIGNED] = &&op_BYTE_ROR_UNSIGNED,
++        [MN_ROL] = &&op_ROL,
++        [MN_ROL | MN_UNSIGNED] = &&op_ROL_UNSIGNED,
++        [MN_WORD | MN_ROL] = &&op_WORD_ROL,
++        [MN_WORD | MN_ROL | MN_UNSIGNED] = &&op_WORD_ROL_UNSIGNED,
++        [MN_BYTE | MN_ROL] = &&op_BYTE_ROL,
++        [MN_BYTE | MN_ROL | MN_UNSIGNED] = &&op_BYTE_ROL_UNSIGNED,
++        [MN_BAND] = &&op_BAND,
++        [MN_BAND | MN_UNSIGNED] = &&op_BAND_UNSIGNED,
++        [MN_BOR] = &&op_BOR,
++        [MN_BOR | MN_UNSIGNED] = &&op_BOR_UNSIGNED,
++        [MN_BXOR] = &&op_BXOR,
++        [MN_BXOR | MN_UNSIGNED] = &&op_BXOR_UNSIGNED,
++        [MN_BNOT] = &&op_BNOT,
++        [MN_BNOT | MN_UNSIGNED] = &&op_BNOT_UNSIGNED,
++        [MN_BYTE | MN_BNOT] = &&op_BYTE_BNOT,
++        [MN_BYTE | MN_BNOT | MN_UNSIGNED] = &&op_BYTE_BNOT_UNSIGNED,
++        [MN_WORD | MN_BNOT] = &&op_WORD_BNOT,
++        [MN_WORD | MN_BNOT | MN_UNSIGNED] = &&op_WORD_BNOT_UNSIGNED,
++        [MN_AND] = &&op_AND,
++        [MN_OR] = &&op_OR,
++        [MN_XOR] = &&op_XOR,
++        [MN_EQ] = &&op_EQ,
++        [MN_NE] = &&op_NE,
++        [MN_GTE] = &&op_GTE,
++        [MN_GTE | MN_UNSIGNED] = &&op_GTE_UNSIGNED,
++        [MN_LTE] = &&op_LTE,
++        [MN_LTE | MN_UNSIGNED] = &&op_LTE_UNSIGNED,
++        [MN_LT] = &&op_LT,
++        [MN_LT | MN_UNSIGNED] = &&op_LT_UNSIGNED,
++        [MN_GT] = &&op_GT,
++        [MN_GT | MN_UNSIGNED] = &&op_GT_UNSIGNED,
++        [MN_EQ | MN_FLOAT] = &&op_EQ_FLOAT,
++        [MN_NE | MN_FLOAT] = &&op_NE_FLOAT,
++        [MN_GTE | MN_FLOAT] = &&op_GTE_FLOAT,
++        [MN_LTE | MN_FLOAT] = &&op_LTE_FLOAT,
++        [MN_LT | MN_FLOAT] = &&op_LT_FLOAT,
++        [MN_GT | MN_FLOAT] = &&op_GT_FLOAT,
++        [MN_EQ | MN_STRING] = &&op_EQ_STRING,
++        [MN_NE | MN_STRING] = &&op_NE_STRING,
++        [MN_GTE | MN_STRING] = &&op_GTE_STRING,
++        [MN_LTE | MN_STRING] = &&op_LTE_STRING,
++        [MN_LT | MN_STRING] = &&op_LT_STRING,
++        [MN_GT | MN_STRING] = &&op_GT_STRING,
++        [MN_VARADD | MN_STRING] = &&op_VARADD_STRING,
++        [MN_LETNP | MN_STRING] = &&op_LETNP_STRING,
++        [MN_LET | MN_STRING] = &&op_LET_STRING,
++        [MN_ADD | MN_STRING] = &&op_ADD_STRING,
++        [MN_INT2STR] = &&op_INT2STR,
++        [MN_INT2STR | MN_UNSIGNED] = &&op_INT2STR_UNSIGNED,
++        [MN_INT2STR | MN_WORD] = &&op_INT2STR_WORD,
++        [MN_INT2STR | MN_UNSIGNED | MN_WORD] = &&op_INT2STR_UNSIGNED_WORD,
++        [MN_INT2STR | MN_BYTE] = &&op_INT2STR_BYTE,
++        [MN_INT2STR | MN_UNSIGNED | MN_BYTE] = &&op_INT2STR_UNSIGNED_BYTE,
++        [MN_FLOAT2STR] = &&op_FLOAT2STR,
++        [MN_CHR2STR] = &&op_CHR2STR,
++        [MN_STRI2CHR] = &&op_STRI2CHR,
++        [MN_STR2CHR] = &&op_STR2CHR,
++        [MN_POINTER2STR] = &&op_POINTER2STR,
++        [MN_STR2FLOAT] = &&op_STR2FLOAT,
++        [MN_STR2INT] = &&op_STR2INT,
++        [MN_A2STR] = &&op_A2STR,
++        [MN_STR2A] = &&op_STR2A,
++        [MN_STRACAT] = &&op_STRACAT,
++        [MN_LETNP] = &&op_LETNP,
++        [MN_LETNP | MN_UNSIGNED] = &&op_LETNP_UNSIGNED,
++        [MN_LET] = &&op_LET,
++        [MN_LET | MN_UNSIGNED] = &&op_LET_UNSIGNED,
++        [MN_INC] = &&op_INC,
++        [MN_INC | MN_UNSIGNED] = &&op_INC_UNSIGNED,
++        [MN_DEC] = &&op_DEC,
++        [MN_DEC | MN_UNSIGNED] = &&op_DEC_UNSIGNED,
++        [MN_POSTDEC] = &&op_POSTDEC,
++        [MN_POSTDEC | MN_UNSIGNED] = &&op_POSTDEC_UNSIGNED,
++        [MN_POSTINC] = &&op_POSTINC,
++        [MN_POSTINC | MN_UNSIGNED] = &&op_POSTINC_UNSIGNED,
++        [MN_VARADD] = &&op_VARADD,
++        [MN_VARADD | MN_UNSIGNED] = &&op_VARADD_UNSIGNED,
++        [MN_VARSUB] = &&op_VARSUB,
++        [MN_VARSUB | MN_UNSIGNED] = &&op_VARSUB_UNSIGNED,
++        [MN_VARMUL] = &&op_VARMUL,
++        [MN_VARMUL | MN_UNSIGNED] = &&op_VARMUL_UNSIGNED,
++        [MN_VARDIV] = &&op_VARDIV,
++        [MN_VARDIV | MN_UNSIGNED] = &&op_VARDIV_UNSIGNED,
++        [MN_VARMOD] = &&op_VARMOD,
++        [MN_VARMOD | MN_UNSIGNED] = &&op_VARMOD_UNSIGNED,
++        [MN_VAROR] = &&op_VAROR,
++        [MN_VAROR | MN_UNSIGNED] = &&op_VAROR_UNSIGNED,
++        [MN_VARXOR] = &&op_VARXOR,
++        [MN_VARXOR | MN_UNSIGNED] = &&op_VARXOR_UNSIGNED,
++        [MN_VARAND] = &&op_VARAND,
++        [MN_VARAND | MN_UNSIGNED] = &&op_VARAND_UNSIGNED,
++        [MN_VARROR] = &&op_VARROR,
++        [MN_VARROR | MN_UNSIGNED] = &&op_VARROR_UNSIGNED,
++        [MN_VARROL] = &&op_VARROL,
++        [MN_VARROL | MN_UNSIGNED] = &&op_VARROL_UNSIGNED,
++        [MN_WORD | MN_LETNP] = &&op_WORD_LETNP,
++        [MN_WORD | MN_LETNP | MN_UNSIGNED] = &&op_WORD_LETNP_UNSIGNED,
++        [MN_WORD | MN_LET] = &&op_WORD_LET,
++        [MN_WORD | MN_LET | MN_UNSIGNED] = &&op_WORD_LET_UNSIGNED,
++        [MN_WORD | MN_INC] = &&op_WORD_INC,
++        [MN_WORD | MN_INC | MN_UNSIGNED] = &&op_WORD_INC_UNSIGNED,
++        [MN_WORD | MN_DEC] = &&op_WORD_DEC,
++        [MN_WORD | MN_DEC | MN_UNSIGNED] = &&op_WORD_DEC_UNSIGNED,
++        [MN_WORD | MN_POSTDEC] = &&op_WORD_POSTDEC,
++        [MN_WORD | MN_POSTDEC | MN_UNSIGNED] = &&op_WORD_POSTDEC_UNSIGNED,
++        [MN_WORD | MN_POSTINC] = &&op_WORD_POSTINC,
++        [MN_WORD | MN_POSTINC | MN_UNSIGNED] = &&op_WORD_POSTINC_UNSIGNED,
++        [MN_WORD | MN_VARADD] = &&op_WORD_VARADD,
++        [MN_WORD | MN_VARADD | MN_UNSIGNED] = &&op_WORD_VARADD_UNSIGNED,
++        [MN_WORD | MN_VARSUB] = &&op_WORD_VARSUB,
++        [MN_WORD | MN_VARSUB | MN_UNSIGNED] = &&op_WORD_VARSUB_UNSIGNED,
++        [MN_WORD | MN_VARMUL] = &&op_WORD_VARMUL,
++        [MN_WORD | MN_VARMUL | MN_UNSIGNED] = &&op_WORD_VARMUL_UNSIGNED,
++        [MN_WORD | MN_VARDIV] = &&op_WORD_VARDIV,
++        [MN_WORD | MN_VARDIV | MN_UNSIGNED] = &&op_WORD_VARDIV_UNSIGNED,
++        [MN_WORD | MN_VARMOD] = &&op_WORD_VARMOD,
++        [MN_WORD | MN_VARMOD | MN_UNSIGNED] = &&op_WORD_VARMOD_UNSIGNED,
++        [MN_WORD | MN_VAROR] = &&op_WORD_VAROR,
++        [MN_WORD | MN_VAROR | MN_UNSIGNED] = &&op_WORD_VAROR_UNSIGNED,
++        [MN_WORD | MN_VARXOR] = &&op_WORD_VARXOR,
++        [MN_WORD | MN_VARXOR | MN_UNSIGNED] = &&op_WORD_VARXOR_UNSIGNED,
++        [MN_WORD | MN_VARAND] = &&op_WORD_VARAND,
++        [MN_WORD | MN_VARAND | MN_UNSIGNED] = &&op_WORD_VARAND_UNSIGNED,
++        [MN_WORD | MN_VARROR] = &&op_WORD_VARROR,
++        [MN_WORD | MN_VARROR | MN_UNSIGNED] = &&op_WORD_VARROR_UNSIGNED,
++        [MN_WORD | MN_VARROL] = &&op_WORD_VARROL,
++        [MN_WORD | MN_VARROL | MN_UNSIGNED] = &&op_WORD_VARROL_UNSIGNED,
++        [MN_BYTE | MN_LETNP] = &&op_BYTE_LETNP,
++        [MN_BYTE | MN_LETNP | MN_UNSIGNED] = &&op_BYTE_LETNP_UNSIGNED,
++        [MN_BYTE | MN_LET] = &&op_BYTE_LET,
++        [MN_BYTE | MN_LET | MN_UNSIGNED] = &&op_BYTE_LET_UNSIGNED,
++        [MN_BYTE | MN_INC] = &&op_BYTE_INC,
++        [MN_BYTE | MN_INC | MN_UNSIGNED] = &&op_BYTE_INC_UNSIGNED,
++        [MN_BYTE | MN_DEC] = &&op_BYTE_DEC,
++        [MN_BYTE | MN_DEC | MN_UNSIGNED] = &&op_BYTE_DEC_UNSIGNED,
++        [MN_BYTE | MN_POSTDEC] = &&op_BYTE_POSTDEC,
++        [MN_BYTE | MN_POSTDEC | MN_UNSIGNED] = &&op_BYTE_POSTDEC_UNSIGNED,
++        [MN_BYTE | MN_POSTINC] = &&op_BYTE_POSTINC,
++        [MN_BYTE | MN_POSTINC | MN_UNSIGNED] = &&op_BYTE_POSTINC_UNSIGNED,
++        [MN_BYTE | MN_VARADD] = &&op_BYTE_VARADD,
++        [MN_BYTE | MN_VARADD | MN_UNSIGNED] = &&op_BYTE_VARADD_UNSIGNED,
++        [MN_BYTE | MN_VARSUB] = &&op_BYTE_VARSUB,
++        [MN_BYTE | MN_VARSUB | MN_UNSIGNED] = &&op_BYTE_VARSUB_UNSIGNED,
++        [MN_BYTE | MN_VARMUL] = &&op_BYTE_VARMUL,
++        [MN_BYTE | MN_VARMUL | MN_UNSIGNED] = &&op_BYTE_VARMUL_UNSIGNED,
++        [MN_BYTE | MN_VARDIV] = &&op_BYTE_VARDIV,
++        [MN_BYTE | MN_VARDIV | MN_UNSIGNED] = &&op_BYTE_VARDIV_UNSIGNED,
++        [MN_BYTE | MN_VARMOD] = &&op_BYTE_VARMOD,
++        [MN_BYTE | MN_VARMOD | MN_UNSIGNED] = &&op_BYTE_VARMOD_UNSIGNED,
++        [MN_BYTE | MN_VAROR] = &&op_BYTE_VAROR,
++        [MN_BYTE | MN_VAROR | MN_UNSIGNED] = &&op_BYTE_VAROR_UNSIGNED,
++        [MN_BYTE | MN_VARXOR] = &&op_BYTE_VARXOR,
++        [MN_BYTE | MN_VARXOR | MN_UNSIGNED] = &&op_BYTE_VARXOR_UNSIGNED,
++        [MN_BYTE | MN_VARAND] = &&op_BYTE_VARAND,
++        [MN_BYTE | MN_VARAND | MN_UNSIGNED] = &&op_BYTE_VARAND_UNSIGNED,
++        [MN_BYTE | MN_VARROR] = &&op_BYTE_VARROR,
++        [MN_BYTE | MN_VARROR | MN_UNSIGNED] = &&op_BYTE_VARROR_UNSIGNED,
++        [MN_BYTE | MN_VARROL] = &&op_BYTE_VARROL,
++        [MN_BYTE | MN_VARROL | MN_UNSIGNED] = &&op_BYTE_VARROL_UNSIGNED,
++        [MN_FLOAT | MN_LETNP] = &&op_FLOAT_LETNP,
++        [MN_FLOAT | MN_LET] = &&op_FLOAT_LET,
++        [MN_FLOAT | MN_INC] = &&op_FLOAT_INC,
++        [MN_FLOAT | MN_DEC] = &&op_FLOAT_DEC,
++        [MN_FLOAT | MN_POSTDEC] = &&op_FLOAT_POSTDEC,
++        [MN_FLOAT | MN_POSTINC] = &&op_FLOAT_POSTINC,
++        [MN_FLOAT | MN_VARADD] = &&op_FLOAT_VARADD,
++        [MN_FLOAT | MN_VARSUB] = &&op_FLOAT_VARSUB,
++        [MN_FLOAT | MN_VARMUL] = &&op_FLOAT_VARMUL,
++        [MN_FLOAT | MN_VARDIV] = &&op_FLOAT_VARDIV,
++        [MN_JUMP] = &&op_JUMP,
++        [MN_JTRUE] = &&op_JTRUE,
++        [MN_JFALSE] = &&op_JFALSE,
++        [MN_JTTRUE] = &&op_JTTRUE,
++        [MN_JTFALSE] = &&op_JTFALSE,
++        [MN_NCALL] = &&op_NCALL,
++        [MN_SWITCH] = &&op_SWITCH,
++        [MN_SWITCH | MN_STRING] = &&op_SWITCH_STRING,
++        [MN_CASE] = &&op_CASE,
++        [MN_CASE | MN_STRING] = &&op_CASE_STRING,
++        [MN_CASE_R] = &&op_CASE_R,
++        [MN_CASE_R | MN_STRING] = &&op_CASE_R_STRING,
++        [MN_JNOCASE] = &&op_JNOCASE,
++        [MN_TYPE] = &&op_TYPE,
++        [MN_FRAME] = &&op_FRAME,
++        [MN_END] = &&op_END,
++        [MN_RETURN] = &&op_RETURN,
++        [MN_EXITHNDLR] = &&op_EXITHNDLR,
++        [MN_ERRHNDLR] = &&op_ERRHNDLR,
++        [MN_DEBUG] = &&op_DEBUG,
++        [MN_SENTENCE] = &&op_SENTENCE,
++    };
++#pragma clang diagnostic pop
++#endif
++
++    /* ------------------------------------------------------------------------------- */
++    /* Restore if exit by debug                                                        */
++
++    if ( debug > 0 ) {
++        printf( "\n>>> Instance:%s ProcID:%d StackUsed:%d/%d\n", r->proc->name,
++                                                                 LOCDWORD( r, PROCESS_ID ),
++                                                                 (int)( r->stack_ptr - r->stack ) / (int)sizeof( r->stack[0] ),
++                                                                 ( r->stack[0] & ~STACK_RETURN_VALUE )
++              );
++    }
++
++    /* Start process or return from frame */
++    /* Hook */
++    if ( instance_pre_execute_hook_count )
++        for ( n = 0; n < instance_pre_execute_hook_count; n++ )
++            instance_pre_execute_hook_list[n]( r );
++    /* Hook */
++
++    // breakpoint on entry
++    if ( r->proc->breakpoint || r->breakpoint ) {
++        debugger_show_console = 1; // *** call debugger when info is available
++        debugger_trace = 1;
++    }
++
++main_loop_instance_go:
++    sp = r->stack_ptr;
++    stack_base = r->stack;
++    status_p = ( uint32_t * )(( uint8_t * ) r->locdata + STATUS );
++    check = 1;
++    trace_sentence = -1;
++
++    while ( 1 ) {
++#if THREADED_DISPATCH
++loop_head:
++#endif
++
++        /* If I was killed or I'm waiting status, then exit. Checked after the
++           opcodes that call outside the loop (system calls, child processes);
++           nothing else changes the status or must_exit while this runs. */
++        if ( check ) {
++            check = 0;
++            if ( must_exit ) break;
++            status = *status_p;
++            if (( status & ~STATUS_WAITING_MASK ) == STATUS_KILLED || ( status & STATUS_WAITING_MASK ) )
++            {
++                r->codeptr = ptr;
++                return_value = LOCDWORD( r, PROCESS_ID );
++                goto break_all;
++            }
++        }
++
++#if !LIBRETRO_CORE
++        /* The libretro build has no debugger console; these two checks cost
++           a fifth of the interpreter loop on an ARM Cortex-A9, so they are
++           compiled out (debug is never set there and a `debug` statement in
++           the game would otherwise spin forever waiting for the console). */
++        if ( trace_sentence != -1 ) {
++             while( debugger_show_console ) {
++                /* Hook */
++                if ( handler_hook_count )
++                    for ( n = 0; n < handler_hook_count; n++ )
++                        handler_hook_list[n].hook();
++                /* Hook */
++            }
++        }
++
++        /* debug output */
++        if ( debug > 0 )
++        {
++            if ( debug > 2 )
++            {
++                r->stack_ptr = sp;
++                int c = 45 - stack_dump( r ) * 9;
++                if ( debug > 1 ) printf( "%*.*s[%4u] ", c, c, "", (int)( ptr - r->code ) );
++            }
++            else if ( debug > 1 ) printf( "[%4u] ", (int)( ptr - r->code ) );
++            mnemonic_dump( *ptr, ptr[1] );
++            fflush(stdout);
++        }
++#endif
++
++#if THREADED_DISPATCH
++        DISPATCH();
++#endif
++
++        switch ( *ptr )
++        {
++            /* No operation */
++            case MN_NOP: OPLABEL(op_NOP)
++                ptr++;
++                NEXT;
++
++            /* Stack manipulation */
++
++            case MN_DUP: OPLABEL(op_DUP)
++                *sp = sp[-1];
++                sp++;
++                ptr++;
++                NEXT;
++
++            case MN_PUSH: OPLABEL(op_PUSH)
++                *sp++ = ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_POP: OPLABEL(op_POP)
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_INDEX: OPLABEL(op_INDEX)
++            case MN_INDEX | MN_UNSIGNED: OPLABEL(op_INDEX_UNSIGNED)
++            case MN_INDEX | MN_STRING: OPLABEL(op_INDEX_STRING)
++            case MN_INDEX | MN_WORD: OPLABEL(op_INDEX_WORD)
++            case MN_INDEX | MN_WORD | MN_UNSIGNED: OPLABEL(op_INDEX_WORD_UNSIGNED)
++            case MN_INDEX | MN_BYTE: OPLABEL(op_INDEX_BYTE)
++            case MN_INDEX | MN_BYTE | MN_UNSIGNED: OPLABEL(op_INDEX_BYTE_UNSIGNED)
++            case MN_INDEX | MN_FLOAT: OPLABEL(op_INDEX_FLOAT) /* Add float, I don't know why it was missing (SplinterGU) */
++                sp[-1] += ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_ARRAY: OPLABEL(op_ARRAY)
++                sp[-2] += ( ptr[1] * sp[-1] );
++                sp--;
++                ptr += 2;
++                NEXT;
++
++            /* Process calls */
++
++            case MN_CLONE: OPLABEL(op_CLONE)
++                r->stack_ptr = sp;
++                i = instance_duplicate( r );
++                i->codeptr = ptr + 2;
++                ptr = r->code + ptr[1];
++                CONTINUE;
++
++            case MN_CALL: OPLABEL(op_CALL)
++            case MN_PROC: OPLABEL(op_PROC)
++            {
++                PROCDEF * proc = procdef_get( ptr[1] );
++
++                if ( !proc ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown process\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++
++                /* Process uses FRAME or locals, must create an instance */
++                r->stack_ptr = sp;
++                i = instance_new( proc, r );
++
++                assert ( i );
++
++                for ( n = 0; n < proc->params; n++ )
++                    PRIDWORD( i, 4 * n ) = sp[-proc->params+n];
++
++                sp -= proc->params;
++
++                /* I go to waiting status (by default) */
++                LOCDWORD( r, STATUS ) |= STATUS_WAITING_MASK;
++                i->called_by   = r;
++
++                if ( debugger_step ) {
++                    debugger_step_pending = 1;
++                    debugger_step = 0;
++                }
++
++                /* Run the process/function */
++                if ( *ptr == MN_CALL ) {
++                    r->stack[0] |= STACK_RETURN_VALUE;
++                    sp++;
++                    r->stack_ptr = sp;
++                    *sp = instance_go( i );
++                } else {
++                    r->stack[0] &= ~STACK_RETURN_VALUE;
++                    r->stack_ptr = sp;
++                    instance_go( i );
++                }
++
++                if ( debugger_step_pending ) {
++                    debugger_step_pending = 0;
++                    debugger_step = 1;
++                }
++
++                child_is_alive = instance_exists( i );
++
++                ptr += 2;
++
++                /* If the process is a function in a frame, save the stack and leave */
++                /* If the process/function still running, then it is in a FRAME.
++                   If the process/function is running code, then it his status is RUNNING */
++                if ( child_is_alive &&
++                        (
++                            (( status = LOCDWORD( r, STATUS ) ) &  STATUS_WAITING_MASK ) ||
++                            ( status & ~STATUS_WAITING_MASK ) == STATUS_FROZEN ||
++                            ( status & ~STATUS_WAITING_MASK ) == STATUS_SLEEPING
++                        )
++                   ) {
++                    /* I go to sleep and return from this process/function */
++                    i->called_by   = r;
++
++                    /* Save the instruction pointer */
++                    /* This instance don't run other code until the child return */
++                    r->codeptr = ptr;
++
++                    /* If it don't was a CALL, then I set a flag in "len" for no return value */
++                    if ( ptr[-2] == MN_CALL )   r->stack[0] |= STACK_RETURN_VALUE;
++                    else                        r->stack[0] &= ~STACK_RETURN_VALUE;
++
++                    r->stack_ptr = sp;
++                    return 0;
++                }
++
++                /* Wake up! */
++                LOCDWORD( r, STATUS ) &= ~STATUS_WAITING_MASK;
++                if ( child_is_alive ) i->called_by = NULL;
++
++                check = 1;
++                NEXT;
++            }
++
++            case MN_SYSCALL: OPLABEL(op_SYSCALL)
++                p = sysproc_get( ptr[1] );
++                if ( !p ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown system function\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp -= p->params;
++                r->stack_ptr = sp;
++                *sp = ( *p->func )( r, sp );
++                sp++;
++                ptr += 2;
++                check = 1;
++                NEXT;
++
++            case MN_SYSPROC: OPLABEL(op_SYSPROC)
++                p = sysproc_get( ptr[1] );
++                if ( !p ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Unknown system process\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp -= p->params;
++                r->stack_ptr = sp;
++                ( *p->func )( r, sp );
++                ptr += 2;
++                check = 1;
++                NEXT;
++
++            /* Access to variables address */
++
++            case MN_PRIVATE: OPLABEL(op_PRIVATE)
++            case MN_PRIVATE | MN_UNSIGNED: OPLABEL(op_PRIVATE_UNSIGNED)
++            case MN_PRIVATE | MN_WORD: OPLABEL(op_PRIVATE_WORD)
++            case MN_PRIVATE | MN_BYTE: OPLABEL(op_PRIVATE_BYTE)
++            case MN_PRIVATE | MN_WORD | MN_UNSIGNED: OPLABEL(op_PRIVATE_WORD_UNSIGNED)
++            case MN_PRIVATE | MN_BYTE | MN_UNSIGNED: OPLABEL(op_PRIVATE_BYTE_UNSIGNED)
++            case MN_PRIVATE | MN_STRING: OPLABEL(op_PRIVATE_STRING)
++            case MN_PRIVATE | MN_FLOAT: OPLABEL(op_PRIVATE_FLOAT)
++                *sp++ = ( uint32_t ) int_from_ptr(& PRIDWORD( r, ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            case MN_PUBLIC: OPLABEL(op_PUBLIC)
++            case MN_PUBLIC | MN_UNSIGNED: OPLABEL(op_PUBLIC_UNSIGNED)
++            case MN_PUBLIC | MN_WORD: OPLABEL(op_PUBLIC_WORD)
++            case MN_PUBLIC | MN_BYTE: OPLABEL(op_PUBLIC_BYTE)
++            case MN_PUBLIC | MN_WORD | MN_UNSIGNED: OPLABEL(op_PUBLIC_WORD_UNSIGNED)
++            case MN_PUBLIC | MN_BYTE | MN_UNSIGNED: OPLABEL(op_PUBLIC_BYTE_UNSIGNED)
++            case MN_PUBLIC | MN_STRING: OPLABEL(op_PUBLIC_STRING)
++            case MN_PUBLIC | MN_FLOAT: OPLABEL(op_PUBLIC_FLOAT)
++                *sp++ = ( uint32_t ) int_from_ptr(& PUBDWORD( r, ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            case MN_LOCAL: OPLABEL(op_LOCAL)
++            case MN_LOCAL | MN_UNSIGNED: OPLABEL(op_LOCAL_UNSIGNED)
++            case MN_LOCAL | MN_WORD: OPLABEL(op_LOCAL_WORD)
++            case MN_LOCAL | MN_BYTE: OPLABEL(op_LOCAL_BYTE)
++            case MN_LOCAL | MN_WORD | MN_UNSIGNED: OPLABEL(op_LOCAL_WORD_UNSIGNED)
++            case MN_LOCAL | MN_BYTE | MN_UNSIGNED: OPLABEL(op_LOCAL_BYTE_UNSIGNED)
++            case MN_LOCAL | MN_STRING: OPLABEL(op_LOCAL_STRING)
++            case MN_LOCAL | MN_FLOAT: OPLABEL(op_LOCAL_FLOAT)
++                *sp++ = ( uint32_t ) int_from_ptr(& LOCDWORD( r, ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            case MN_GLOBAL: OPLABEL(op_GLOBAL)
++            case MN_GLOBAL | MN_UNSIGNED: OPLABEL(op_GLOBAL_UNSIGNED)
++            case MN_GLOBAL | MN_WORD: OPLABEL(op_GLOBAL_WORD)
++            case MN_GLOBAL | MN_BYTE: OPLABEL(op_GLOBAL_BYTE)
++            case MN_GLOBAL | MN_WORD | MN_UNSIGNED: OPLABEL(op_GLOBAL_WORD_UNSIGNED)
++            case MN_GLOBAL | MN_BYTE | MN_UNSIGNED: OPLABEL(op_GLOBAL_BYTE_UNSIGNED)
++            case MN_GLOBAL | MN_STRING: OPLABEL(op_GLOBAL_STRING)
++            case MN_GLOBAL | MN_FLOAT: OPLABEL(op_GLOBAL_FLOAT)
++                *sp++ = ( uint32_t ) int_from_ptr(& GLODWORD( ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            case MN_REMOTE: OPLABEL(op_REMOTE)
++            case MN_REMOTE | MN_UNSIGNED: OPLABEL(op_REMOTE_UNSIGNED)
++            case MN_REMOTE | MN_WORD: OPLABEL(op_REMOTE_WORD)
++            case MN_REMOTE | MN_BYTE: OPLABEL(op_REMOTE_BYTE)
++            case MN_REMOTE | MN_WORD | MN_UNSIGNED: OPLABEL(op_REMOTE_WORD_UNSIGNED)
++            case MN_REMOTE | MN_BYTE | MN_UNSIGNED: OPLABEL(op_REMOTE_BYTE_UNSIGNED)
++            case MN_REMOTE | MN_STRING: OPLABEL(op_REMOTE_STRING)
++            case MN_REMOTE | MN_FLOAT: OPLABEL(op_REMOTE_FLOAT)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = ( uint32_t ) int_from_ptr(& LOCDWORD( i, ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            case MN_REMOTE_PUBLIC: OPLABEL(op_REMOTE_PUBLIC)
++            case MN_REMOTE_PUBLIC | MN_UNSIGNED: OPLABEL(op_REMOTE_PUBLIC_UNSIGNED)
++            case MN_REMOTE_PUBLIC | MN_WORD: OPLABEL(op_REMOTE_PUBLIC_WORD)
++            case MN_REMOTE_PUBLIC | MN_BYTE: OPLABEL(op_REMOTE_PUBLIC_BYTE)
++            case MN_REMOTE_PUBLIC | MN_WORD | MN_UNSIGNED: OPLABEL(op_REMOTE_PUBLIC_WORD_UNSIGNED)
++            case MN_REMOTE_PUBLIC | MN_BYTE | MN_UNSIGNED: OPLABEL(op_REMOTE_PUBLIC_BYTE_UNSIGNED)
++            case MN_REMOTE_PUBLIC | MN_STRING: OPLABEL(op_REMOTE_PUBLIC_STRING)
++            case MN_REMOTE_PUBLIC | MN_FLOAT: OPLABEL(op_REMOTE_PUBLIC_FLOAT)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = ( uint32_t ) int_from_ptr(& PUBDWORD( i, ptr[1] ));
++                ptr += 2;
++                NEXT;
++
++            /* Access to variables DWORD type */
++
++            case MN_GET_PRIV: OPLABEL(op_GET_PRIV)
++            case MN_GET_PRIV | MN_FLOAT: OPLABEL(op_GET_PRIV_FLOAT)
++            case MN_GET_PRIV | MN_UNSIGNED: OPLABEL(op_GET_PRIV_UNSIGNED)
++                *sp++ = PRIDWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_PUBLIC: OPLABEL(op_GET_PUBLIC)
++            case MN_GET_PUBLIC | MN_FLOAT: OPLABEL(op_GET_PUBLIC_FLOAT)
++            case MN_GET_PUBLIC | MN_UNSIGNED: OPLABEL(op_GET_PUBLIC_UNSIGNED)
++                *sp++ = PUBDWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_LOCAL: OPLABEL(op_GET_LOCAL)
++            case MN_GET_LOCAL | MN_FLOAT: OPLABEL(op_GET_LOCAL_FLOAT)
++            case MN_GET_LOCAL | MN_UNSIGNED: OPLABEL(op_GET_LOCAL_UNSIGNED)
++                *sp++ = LOCDWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_GLOBAL: OPLABEL(op_GET_GLOBAL)
++            case MN_GET_GLOBAL | MN_FLOAT: OPLABEL(op_GET_GLOBAL_FLOAT)
++            case MN_GET_GLOBAL | MN_UNSIGNED: OPLABEL(op_GET_GLOBAL_UNSIGNED)
++                *sp++ = GLODWORD( ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_REMOTE: OPLABEL(op_GET_REMOTE)
++            case MN_GET_REMOTE | MN_FLOAT: OPLABEL(op_GET_REMOTE_FLOAT)
++            case MN_GET_REMOTE | MN_UNSIGNED: OPLABEL(op_GET_REMOTE_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCDWORD( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_REMOTE_PUBLIC: OPLABEL(op_GET_REMOTE_PUBLIC)
++            case MN_GET_REMOTE_PUBLIC | MN_FLOAT: OPLABEL(op_GET_REMOTE_PUBLIC_FLOAT)
++            case MN_GET_REMOTE_PUBLIC | MN_UNSIGNED: OPLABEL(op_GET_REMOTE_PUBLIC_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBDWORD( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_PTR: OPLABEL(op_PTR)
++            case MN_PTR | MN_UNSIGNED: OPLABEL(op_PTR_UNSIGNED)
++            case MN_PTR | MN_FLOAT: OPLABEL(op_PTR_FLOAT)
++                sp[-1] = *( int32_t * )ptr_from_int(sp[-1]);
++                ptr++;
++                NEXT;
++
++            /* Access to variables STRING type */
++
++            case MN_PUSH | MN_STRING: OPLABEL(op_PUSH_STRING)
++                *sp++ = ptr[1];
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_PRIV | MN_STRING: OPLABEL(op_GET_PRIV_STRING)
++                *sp++ = PRIDWORD( r, ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_PUBLIC | MN_STRING: OPLABEL(op_GET_PUBLIC_STRING)
++                *sp++ = PUBDWORD( r, ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_LOCAL | MN_STRING: OPLABEL(op_GET_LOCAL_STRING)
++                *sp++ = LOCDWORD( r, ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_GLOBAL | MN_STRING: OPLABEL(op_GET_GLOBAL_STRING)
++                *sp++ = GLODWORD( ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_REMOTE | MN_STRING: OPLABEL(op_GET_REMOTE_STRING)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCDWORD( i, ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_GET_REMOTE_PUBLIC | MN_STRING: OPLABEL(op_GET_REMOTE_PUBLIC_STRING)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBDWORD( i, ptr[1] );
++                string_use( sp[-1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_STRING | MN_PTR: OPLABEL(op_STRING_PTR)
++                sp[-1] = *( int32_t * )ptr_from_int(sp[-1]);
++                string_use( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_STRING | MN_POP: OPLABEL(op_STRING_POP)
++                string_discard( sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Access to variables WORD type */
++
++            case MN_WORD | MN_GET_PRIV: OPLABEL(op_WORD_GET_PRIV)
++                *sp++ = PRIINT16( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_PRIV | MN_UNSIGNED: OPLABEL(op_WORD_GET_PRIV_UNSIGNED)
++                *sp++ = PRIWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_PUBLIC: OPLABEL(op_WORD_GET_PUBLIC)
++                *sp++ = PUBINT16( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_PUBLIC | MN_UNSIGNED: OPLABEL(op_WORD_GET_PUBLIC_UNSIGNED)
++                *sp++ = PUBWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_LOCAL: OPLABEL(op_WORD_GET_LOCAL)
++                *sp++ = LOCINT16( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_LOCAL | MN_UNSIGNED: OPLABEL(op_WORD_GET_LOCAL_UNSIGNED)
++                *sp++ = LOCWORD( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_GLOBAL: OPLABEL(op_WORD_GET_GLOBAL)
++                *sp++ = GLOINT16( ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_GLOBAL | MN_UNSIGNED: OPLABEL(op_WORD_GET_GLOBAL_UNSIGNED)
++                *sp++ = GLOWORD( ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_REMOTE: OPLABEL(op_WORD_GET_REMOTE)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCINT16( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_REMOTE | MN_UNSIGNED: OPLABEL(op_WORD_GET_REMOTE_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCWORD( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_REMOTE_PUBLIC: OPLABEL(op_WORD_GET_REMOTE_PUBLIC)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBINT16( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED: OPLABEL(op_WORD_GET_REMOTE_PUBLIC_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBWORD( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_PTR: OPLABEL(op_WORD_PTR)
++                sp[-1] = *( int16_t * )ptr_from_int(sp[-1]);
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_PTR | MN_UNSIGNED: OPLABEL(op_WORD_PTR_UNSIGNED)
++                sp[-1] = *( uint16_t * )ptr_from_int(sp[-1]);
++                ptr++;
++                NEXT;
++
++            /* Access to variables BYTE type */
++
++            case MN_BYTE | MN_GET_PRIV: OPLABEL(op_BYTE_GET_PRIV)
++                *sp++ = PRIINT8( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_PRIV | MN_UNSIGNED: OPLABEL(op_BYTE_GET_PRIV_UNSIGNED)
++                *sp++ = PRIBYTE( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_PUBLIC: OPLABEL(op_BYTE_GET_PUBLIC)
++                *sp++ = PUBINT8( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_PUBLIC | MN_UNSIGNED: OPLABEL(op_BYTE_GET_PUBLIC_UNSIGNED)
++                *sp++ = PUBBYTE( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_LOCAL: OPLABEL(op_BYTE_GET_LOCAL)
++                *sp++ = LOCINT8( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_LOCAL | MN_UNSIGNED: OPLABEL(op_BYTE_GET_LOCAL_UNSIGNED)
++                *sp++ = LOCBYTE( r, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_GLOBAL: OPLABEL(op_BYTE_GET_GLOBAL)
++                *sp++ = GLOINT8( ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_GLOBAL | MN_UNSIGNED: OPLABEL(op_BYTE_GET_GLOBAL_UNSIGNED)
++                *sp++ = GLOBYTE( ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_REMOTE: OPLABEL(op_BYTE_GET_REMOTE)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCINT8( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_REMOTE | MN_UNSIGNED: OPLABEL(op_BYTE_GET_REMOTE_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = LOCBYTE( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_REMOTE_PUBLIC: OPLABEL(op_BYTE_GET_REMOTE_PUBLIC)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBINT8( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_GET_REMOTE_PUBLIC | MN_UNSIGNED: OPLABEL(op_BYTE_GET_REMOTE_PUBLIC_UNSIGNED)
++                i = instance_get( sp[-1] );
++                if ( !i ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Process %d not active\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), sp[-1] );
++                    exit( 0 );
++                }
++                sp[-1] = PUBBYTE( i, ptr[1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_PTR: OPLABEL(op_BYTE_PTR)
++                sp[-1] = *(( int8_t * )ptr_from_int(sp[-1]) );
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_PTR | MN_UNSIGNED: OPLABEL(op_BYTE_PTR_UNSIGNED)
++                sp[-1] = *(( uint8_t * )ptr_from_int(sp[-1]) );
++                ptr++;
++                NEXT;
++
++            /* Floating point math */
++
++            case MN_FLOAT | MN_NEG: OPLABEL(op_FLOAT_NEG)
++                *( float * )&sp[-1] = -*(( float * ) & sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_NOT: OPLABEL(op_FLOAT_NOT)
++                *( float * )&sp[-1] = ( float ) !*(( float * ) & sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_ADD: OPLABEL(op_FLOAT_ADD)
++                *( float * )&sp[-2] += *(( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_SUB: OPLABEL(op_FLOAT_SUB)
++                *( float * )&sp[-2] -= *(( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_MUL: OPLABEL(op_FLOAT_MUL)
++                *( float * )&sp[-2] *= *(( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_DIV: OPLABEL(op_FLOAT_DIV)
++                *( float * )&sp[-2] /= *(( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT2INT: OPLABEL(op_FLOAT2INT)
++                *( int32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t ) * ( float * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2FLOAT: OPLABEL(op_INT2FLOAT)
++            case MN_INT2FLOAT | MN_UNSIGNED: OPLABEL(op_INT2FLOAT_UNSIGNED)
++                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2FLOAT | MN_UNSIGNED | MN_WORD: OPLABEL(op_INT2FLOAT_UNSIGNED_WORD)
++                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( uint16_t * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2FLOAT | MN_UNSIGNED | MN_BYTE: OPLABEL(op_INT2FLOAT_UNSIGNED_BYTE)
++                *( float * )&( sp[-ptr[1] - 1] ) = ( float ) * ( uint8_t * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2WORD: OPLABEL(op_INT2WORD)
++            case MN_INT2WORD | MN_UNSIGNED: OPLABEL(op_INT2WORD_UNSIGNED)
++                *( uint32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t )( uint16_t ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2BYTE: OPLABEL(op_INT2BYTE)
++            case MN_INT2BYTE | MN_UNSIGNED: OPLABEL(op_INT2BYTE_UNSIGNED)
++                *( uint32_t * )&( sp[-ptr[1] - 1] ) = ( int32_t )( uint8_t ) * ( int32_t * ) & ( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            /* Mathematical operations */
++
++            case MN_NEG: OPLABEL(op_NEG)
++            case MN_NEG | MN_UNSIGNED: OPLABEL(op_NEG_UNSIGNED)
++                sp[-1] = -sp[-1];
++                ptr++;
++                NEXT;
++
++            case MN_NOT: OPLABEL(op_NOT)
++            case MN_NOT | MN_UNSIGNED: OPLABEL(op_NOT_UNSIGNED)
++                sp[-1] = !( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_ADD: OPLABEL(op_ADD)
++                sp[-2] += sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_SUB: OPLABEL(op_SUB)
++                sp[-2] -= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_MUL | MN_WORD: OPLABEL(op_MUL_WORD)
++            case MN_MUL | MN_BYTE: OPLABEL(op_MUL_BYTE)
++            case MN_MUL: OPLABEL(op_MUL)
++                sp[-2] *= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_MUL | MN_WORD | MN_UNSIGNED: OPLABEL(op_MUL_WORD_UNSIGNED)
++            case MN_MUL | MN_BYTE | MN_UNSIGNED: OPLABEL(op_MUL_BYTE_UNSIGNED)
++            case MN_MUL | MN_UNSIGNED: OPLABEL(op_MUL_UNSIGNED)
++                sp[-2] = ( uint32_t )sp[-2] * ( uint32_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_DIV | MN_WORD: OPLABEL(op_DIV_WORD)
++            case MN_DIV | MN_BYTE: OPLABEL(op_DIV_BYTE)
++            case MN_DIV: OPLABEL(op_DIV)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp[-2] /= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_DIV | MN_WORD | MN_UNSIGNED: OPLABEL(op_DIV_WORD_UNSIGNED)
++            case MN_DIV | MN_BYTE | MN_UNSIGNED: OPLABEL(op_DIV_BYTE_UNSIGNED)
++            case MN_DIV | MN_UNSIGNED: OPLABEL(op_DIV_UNSIGNED)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp[-2] = ( uint32_t )sp[-2] / ( uint32_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_MOD | MN_WORD: OPLABEL(op_MOD_WORD)
++            case MN_MOD | MN_BYTE: OPLABEL(op_MOD_BYTE)
++            case MN_MOD: OPLABEL(op_MOD)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp[-2] %= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_MOD | MN_WORD | MN_UNSIGNED: OPLABEL(op_MOD_WORD_UNSIGNED)
++            case MN_MOD | MN_BYTE | MN_UNSIGNED: OPLABEL(op_MOD_BYTE_UNSIGNED)
++            case MN_MOD | MN_UNSIGNED: OPLABEL(op_MOD_UNSIGNED)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                sp[-2] = ( uint32_t )sp[-2] % ( uint32_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Bitwise operations */
++
++            case MN_ROR: OPLABEL(op_ROR)
++                ( sp[-2] ) = (( int32_t )sp[-2] ) >> sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_ROR | MN_UNSIGNED: OPLABEL(op_ROR_UNSIGNED)
++                sp[-2] = (( uint32_t ) sp[-2] ) >> sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_ROR: OPLABEL(op_WORD_ROR)
++                sp[-2] = (( int16_t ) sp[-2] ) >> sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_ROR | MN_UNSIGNED: OPLABEL(op_WORD_ROR_UNSIGNED)
++                sp[-2] = (( uint16_t ) sp[-2] ) >> sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_ROR: OPLABEL(op_BYTE_ROR)
++                sp[-2] = (( int8_t ) sp[-2] >> sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_ROR | MN_UNSIGNED: OPLABEL(op_BYTE_ROR_UNSIGNED)
++                sp[-2] = (( uint8_t ) sp[-2] ) >> sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_ROL: OPLABEL(op_ROL)
++                ( sp[-2] ) = (( int32_t )sp[-2] ) << sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* All the next ROL operations, don't could be necessaries, but well... */
++
++            case MN_ROL | MN_UNSIGNED: OPLABEL(op_ROL_UNSIGNED)
++                ( sp[-2] ) = ( uint32_t )( sp[-2] << sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_ROL: OPLABEL(op_WORD_ROL)
++                ( sp[-2] ) = (( int16_t )sp[-2] ) << sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_ROL | MN_UNSIGNED: OPLABEL(op_WORD_ROL_UNSIGNED)
++                ( sp[-2] ) = ( uint16_t )( sp[-2] << sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_ROL: OPLABEL(op_BYTE_ROL)
++                ( sp[-2] ) = (( int8_t )sp[-2] ) << sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_ROL | MN_UNSIGNED: OPLABEL(op_BYTE_ROL_UNSIGNED)
++                ( sp[-2] ) = ( uint8_t )( sp[-2] << sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BAND: OPLABEL(op_BAND)
++            case MN_BAND | MN_UNSIGNED: OPLABEL(op_BAND_UNSIGNED)
++                sp[-2] &= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BOR: OPLABEL(op_BOR)
++            case MN_BOR | MN_UNSIGNED: OPLABEL(op_BOR_UNSIGNED)
++                sp[-2] |= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BXOR: OPLABEL(op_BXOR)
++            case MN_BXOR | MN_UNSIGNED: OPLABEL(op_BXOR_UNSIGNED)
++                sp[-2] ^= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BNOT: OPLABEL(op_BNOT)
++            case MN_BNOT | MN_UNSIGNED: OPLABEL(op_BNOT_UNSIGNED)
++                sp[-1] = ~( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_BNOT: OPLABEL(op_BYTE_BNOT)
++                sp[-1] = ( int8_t ) ~( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_BNOT | MN_UNSIGNED: OPLABEL(op_BYTE_BNOT_UNSIGNED)
++                sp[-1] = ( uint8_t ) ~( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_BNOT: OPLABEL(op_WORD_BNOT)
++                sp[-1] = ( int16_t ) ~( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_BNOT | MN_UNSIGNED: OPLABEL(op_WORD_BNOT_UNSIGNED)
++                sp[-1] = ( uint16_t ) ~( sp[-1] );
++                ptr++;
++                NEXT;
++
++            /* Logical operations */
++
++            case MN_AND: OPLABEL(op_AND)
++                sp[-2] = sp[-2] && sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_OR: OPLABEL(op_OR)
++                sp[-2] = sp[-2] || sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_XOR: OPLABEL(op_XOR)
++                sp[-2] = ( sp[-2] != 0 ) ^( sp[-1] != 0 );
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Comparisons */
++
++            case MN_EQ: OPLABEL(op_EQ)
++                sp[-2] = ( sp[-2] == sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_NE: OPLABEL(op_NE)
++                sp[-2] = ( sp[-2] != sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GTE: OPLABEL(op_GTE)
++                sp[-2] = ( sp[-2] >= sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GTE | MN_UNSIGNED: OPLABEL(op_GTE_UNSIGNED)
++                sp[-2] = (( uint32_t )sp[-2] >= ( uint32_t )sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LTE: OPLABEL(op_LTE)
++                sp[-2] = ( sp[-2] <= sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LTE | MN_UNSIGNED: OPLABEL(op_LTE_UNSIGNED)
++                sp[-2] = (( uint32_t )sp[-2] <= ( uint32_t )sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LT: OPLABEL(op_LT)
++                sp[-2] = ( sp[-2] < sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LT | MN_UNSIGNED: OPLABEL(op_LT_UNSIGNED)
++                sp[-2] = (( uint32_t )sp[-2] < ( uint32_t )sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GT: OPLABEL(op_GT)
++                sp[-2] = ( sp[-2] > sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GT | MN_UNSIGNED: OPLABEL(op_GT_UNSIGNED)
++                sp[-2] = (( uint32_t )sp[-2] > ( uint32_t )sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Floating point comparisons */
++
++            case MN_EQ | MN_FLOAT: OPLABEL(op_EQ_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] == *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_NE | MN_FLOAT: OPLABEL(op_NE_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] != *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GTE | MN_FLOAT: OPLABEL(op_GTE_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] >= *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LTE | MN_FLOAT: OPLABEL(op_LTE_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] <= *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LT | MN_FLOAT: OPLABEL(op_LT_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] < *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GT | MN_FLOAT: OPLABEL(op_GT_FLOAT)
++                sp[-2] = ( *( float * ) & sp[-2] > *( float * ) & sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* String comparisons */
++
++            case MN_EQ | MN_STRING : OPLABEL(op_EQ_STRING)
++                n = string_comp( sp[-2], sp[-1] ) == 0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_NE | MN_STRING : OPLABEL(op_NE_STRING)
++                n = string_comp( sp[-2], sp[-1] ) != 0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GTE | MN_STRING : OPLABEL(op_GTE_STRING)
++                n = string_comp( sp[-2], sp[-1] ) >= 0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LTE | MN_STRING : OPLABEL(op_LTE_STRING)
++                n = string_comp( sp[-2], sp[-1] ) <= 0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LT | MN_STRING : OPLABEL(op_LT_STRING)
++                n = string_comp( sp[-2], sp[-1] ) <  0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_GT | MN_STRING : OPLABEL(op_GT_STRING)
++                n = string_comp( sp[-2], sp[-1] ) >  0;
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp[-2] = n;
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* String operations */
++
++            case MN_VARADD | MN_STRING: OPLABEL(op_VARADD_STRING)
++                tmp = ptr_from_int( sp[-2] );
++                n = *( int32_t * )tmp;
++                *( int32_t * )tmp = string_add( n, sp[-1] );
++                string_use( *( int32_t * )tmp );
++                string_discard( n );
++                string_discard( sp[-1] );
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_LETNP | MN_STRING: OPLABEL(op_LETNP_STRING)
++                tmp = ptr_from_int( sp[-2] );
++                string_discard( *( int32_t * )tmp );
++                ( *( int32_t * )tmp ) = sp[-1];
++                sp -= 2;
++                ptr++;
++                NEXT;
++
++            case MN_LET | MN_STRING: OPLABEL(op_LET_STRING)
++                tmp = ptr_from_int( sp[-2] );
++                string_discard( *( int32_t * )tmp );
++                ( *( int32_t * )tmp ) = sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_ADD | MN_STRING: OPLABEL(op_ADD_STRING)
++                n = string_add( sp[-2], sp[-1] );
++                string_use( n );
++                string_discard( sp[-2] );
++                string_discard( sp[-1] );
++                sp--;
++                sp[-1] = n;
++                ptr++;
++                NEXT;
++
++            case MN_INT2STR: OPLABEL(op_INT2STR)
++                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2STR | MN_UNSIGNED: OPLABEL(op_INT2STR_UNSIGNED)
++                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2STR | MN_WORD: OPLABEL(op_INT2STR_WORD)
++                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2STR | MN_UNSIGNED | MN_WORD: OPLABEL(op_INT2STR_UNSIGNED_WORD)
++                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2STR | MN_BYTE: OPLABEL(op_INT2STR_BYTE)
++                sp[-ptr[1] - 1] = string_itoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_INT2STR | MN_UNSIGNED | MN_BYTE: OPLABEL(op_INT2STR_UNSIGNED_BYTE)
++                sp[-ptr[1] - 1] = string_uitoa( sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_FLOAT2STR: OPLABEL(op_FLOAT2STR)
++                sp[-ptr[1] - 1] = string_ftoa( *( float * ) & sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_CHR2STR: OPLABEL(op_CHR2STR)
++            {
++                char buffer[2];
++                buffer[0] = ( uint8_t )sp[-ptr[1] - 1];
++                buffer[1] = 0;
++                sp[-ptr[1] - 1] = string_new( buffer );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++            }
++
++            case MN_STRI2CHR: OPLABEL(op_STRI2CHR)
++                n = string_char( sp[-2], sp[-1] );
++                string_discard( sp[-2] );
++                sp--;
++                sp[-1] = n;
++                ptr++;
++                NEXT;
++
++            case MN_STR2CHR: OPLABEL(op_STR2CHR)
++                n = sp[-ptr[1] - 1];
++                sp[-1] = *string_get( n );
++                string_discard( n );
++                ptr += 2;
++                NEXT;
++
++            case MN_POINTER2STR: OPLABEL(op_POINTER2STR)
++                // This just seems to convert a pointer to a string, using the offset seems fine
++                sp[-ptr[1] - 1] = string_ptoa( ( void * ) (size_t)sp[-ptr[1] - 1] );
++                string_use( sp[-ptr[1] - 1] );
++                ptr += 2;
++                NEXT;
++
++            case MN_STR2FLOAT: OPLABEL(op_STR2FLOAT)
++                n = sp[-ptr[1] - 1];
++                str = ( char * )string_get( n );
++                *( float * )( &sp[-ptr[1] - 1] ) = str ? ( float )atof( str ) : 0.0f;
++                string_discard( n );
++                ptr += 2;
++                NEXT;
++
++            case MN_STR2INT: OPLABEL(op_STR2INT)
++                n = sp[-ptr[1] - 1];
++                str = ( char * )string_get( n );
++                sp[-ptr[1] - 1] = str ? atoi( str ) : 0;
++                string_discard( n );
++                ptr += 2;
++                NEXT;
++
++            /* Fixed-length strings operations*/
++
++            case MN_A2STR: OPLABEL(op_A2STR)
++                str = ( char * )ptr_from_int( sp[-ptr[1] - 1] );
++                n = string_new( str );
++                string_use( n );
++                sp[-ptr[1] - 1] = n;
++                ptr += 2;
++                NEXT;
++
++            case MN_STR2A: OPLABEL(op_STR2A)
++                n = sp[-1];
++                tmp = ptr_from_int(sp[-2]);
++                strncpy( ( char * )tmp, string_get( n ), ptr[1] );
++                (( char * )tmp )[ptr[1]] = 0;
++                sp[-2] = sp[-1];
++                sp--;
++                ptr += 2;
++                NEXT;
++
++            case MN_STRACAT: OPLABEL(op_STRACAT)
++                n = sp[-1];
++                tmp = ptr_from_int( sp[-2]);
++                strncat( ( char * )tmp, string_get( n ), (ptr[1]-1) - strlen( ( char * )tmp ) );
++                (( char * )tmp )[ptr[1]-1] = 0;
++                sp[-2] = sp[-1];
++                sp--;
++                ptr += 2;
++                NEXT;
++
++            /* Direct operations with variables DWORD type */
++
++            case MN_LETNP: OPLABEL(op_LETNP)
++            case MN_LETNP | MN_UNSIGNED: OPLABEL(op_LETNP_UNSIGNED)
++                ( *( int32_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp -= 2;
++                ptr++;
++                NEXT;
++
++            case MN_LET: OPLABEL(op_LET)
++            case MN_LET | MN_UNSIGNED: OPLABEL(op_LET_UNSIGNED)
++                ( *( int32_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_INC: OPLABEL(op_INC)
++            case MN_INC | MN_UNSIGNED: OPLABEL(op_INC_UNSIGNED)
++                ( *( int32_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_DEC: OPLABEL(op_DEC)
++            case MN_DEC | MN_UNSIGNED: OPLABEL(op_DEC_UNSIGNED)
++                ( *( int32_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_POSTDEC: OPLABEL(op_POSTDEC)
++            case MN_POSTDEC | MN_UNSIGNED: OPLABEL(op_POSTDEC_UNSIGNED)
++                tmp = ptr_from_int( sp[-1] );
++                ( *( int32_t * )tmp ) -= ptr[1];
++                sp[-1] = *( int32_t * )tmp + ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_POSTINC: OPLABEL(op_POSTINC)
++            case MN_POSTINC | MN_UNSIGNED: OPLABEL(op_POSTINC_UNSIGNED)
++                tmp = ptr_from_int( sp[-1] );
++                *(( int32_t * )tmp ) += ptr[1];
++                sp[-1] = *( int32_t * )tmp - ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_VARADD: OPLABEL(op_VARADD)
++            case MN_VARADD | MN_UNSIGNED: OPLABEL(op_VARADD_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) += sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARSUB: OPLABEL(op_VARSUB)
++            case MN_VARSUB | MN_UNSIGNED: OPLABEL(op_VARSUB_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) -= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARMUL: OPLABEL(op_VARMUL)
++            case MN_VARMUL | MN_UNSIGNED: OPLABEL(op_VARMUL_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) *= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARDIV: OPLABEL(op_VARDIV)
++            case MN_VARDIV | MN_UNSIGNED: OPLABEL(op_VARDIV_UNSIGNED)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( int32_t * )ptr_from_int( sp[-2] ) /= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARMOD: OPLABEL(op_VARMOD)
++            case MN_VARMOD | MN_UNSIGNED: OPLABEL(op_VARMOD_UNSIGNED)
++                if ( sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( int32_t * )ptr_from_int( sp[-2] ) %= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VAROR: OPLABEL(op_VAROR)
++            case MN_VAROR | MN_UNSIGNED: OPLABEL(op_VAROR_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) |= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARXOR: OPLABEL(op_VARXOR)
++            case MN_VARXOR | MN_UNSIGNED: OPLABEL(op_VARXOR_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARAND: OPLABEL(op_VARAND)
++            case MN_VARAND | MN_UNSIGNED: OPLABEL(op_VARAND_UNSIGNED)
++                *( int32_t * )ptr_from_int( sp[-2] ) &= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARROR: OPLABEL(op_VARROR)
++                *( int32_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARROR | MN_UNSIGNED: OPLABEL(op_VARROR_UNSIGNED)
++                *( uint32_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARROL: OPLABEL(op_VARROL)
++                *( int32_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_VARROL | MN_UNSIGNED: OPLABEL(op_VARROL_UNSIGNED)
++                *( uint32_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Direct operations with variables WORD type */
++
++            case MN_WORD | MN_LETNP: OPLABEL(op_WORD_LETNP)
++            case MN_WORD | MN_LETNP | MN_UNSIGNED: OPLABEL(op_WORD_LETNP_UNSIGNED)
++                ( *( int16_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp -= 2;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_LET: OPLABEL(op_WORD_LET)
++            case MN_WORD | MN_LET | MN_UNSIGNED: OPLABEL(op_WORD_LET_UNSIGNED)
++                ( *( int16_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_INC: OPLABEL(op_WORD_INC)
++            case MN_WORD | MN_INC | MN_UNSIGNED: OPLABEL(op_WORD_INC_UNSIGNED)
++                ( *( int16_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_DEC: OPLABEL(op_WORD_DEC)
++            case MN_WORD | MN_DEC | MN_UNSIGNED: OPLABEL(op_WORD_DEC_UNSIGNED)
++                ( *( int16_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_POSTDEC: OPLABEL(op_WORD_POSTDEC)
++            case MN_WORD | MN_POSTDEC | MN_UNSIGNED: OPLABEL(op_WORD_POSTDEC_UNSIGNED)
++                tmp = ptr_from_int(sp[-1]);
++                ( *( int16_t * )tmp ) -= ptr[1];
++                sp[-1] = *( int16_t * )tmp + ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_POSTINC: OPLABEL(op_WORD_POSTINC)
++            case MN_WORD | MN_POSTINC | MN_UNSIGNED: OPLABEL(op_WORD_POSTINC_UNSIGNED)
++                tmp = ptr_from_int(sp[-1]);
++                *(( int16_t * )tmp ) += ptr[1];
++                sp[-1] = *( int16_t * )tmp - ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_WORD | MN_VARADD: OPLABEL(op_WORD_VARADD)
++            case MN_WORD | MN_VARADD | MN_UNSIGNED: OPLABEL(op_WORD_VARADD_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) += sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARSUB: OPLABEL(op_WORD_VARSUB)
++            case MN_WORD | MN_VARSUB | MN_UNSIGNED: OPLABEL(op_WORD_VARSUB_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) -= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARMUL: OPLABEL(op_WORD_VARMUL)
++            case MN_WORD | MN_VARMUL | MN_UNSIGNED: OPLABEL(op_WORD_VARMUL_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) *= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARDIV: OPLABEL(op_WORD_VARDIV)
++            case MN_WORD | MN_VARDIV | MN_UNSIGNED: OPLABEL(op_WORD_VARDIV_UNSIGNED)
++                if (( int16_t )sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( int16_t * )ptr_from_int( sp[-2] ) /= ( int16_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARMOD: OPLABEL(op_WORD_VARMOD)
++            case MN_WORD | MN_VARMOD | MN_UNSIGNED: OPLABEL(op_WORD_VARMOD_UNSIGNED)
++                if (( int16_t )sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( int16_t * )ptr_from_int( sp[-2] ) %= ( int16_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VAROR: OPLABEL(op_WORD_VAROR)
++            case MN_WORD | MN_VAROR | MN_UNSIGNED: OPLABEL(op_WORD_VAROR_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) |= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARXOR: OPLABEL(op_WORD_VARXOR)
++            case MN_WORD | MN_VARXOR | MN_UNSIGNED: OPLABEL(op_WORD_VARXOR_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARAND: OPLABEL(op_WORD_VARAND)
++            case MN_WORD | MN_VARAND | MN_UNSIGNED: OPLABEL(op_WORD_VARAND_UNSIGNED)
++                *( int16_t * )ptr_from_int( sp[-2] ) &= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARROR: OPLABEL(op_WORD_VARROR)
++                *( int16_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARROR | MN_UNSIGNED: OPLABEL(op_WORD_VARROR_UNSIGNED)
++                *( uint16_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARROL: OPLABEL(op_WORD_VARROL)
++                *( int16_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_WORD | MN_VARROL | MN_UNSIGNED: OPLABEL(op_WORD_VARROL_UNSIGNED)
++                *( uint16_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Direct operations with variables BYTE type */
++
++            case MN_BYTE | MN_LETNP: OPLABEL(op_BYTE_LETNP)
++            case MN_BYTE | MN_LETNP | MN_UNSIGNED: OPLABEL(op_BYTE_LETNP_UNSIGNED)
++                ( *( uint8_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp -= 2;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_LET: OPLABEL(op_BYTE_LET)
++            case MN_BYTE | MN_LET | MN_UNSIGNED: OPLABEL(op_BYTE_LET_UNSIGNED)
++                ( *( uint8_t * )ptr_from_int( sp[-2] ) ) = sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_INC: OPLABEL(op_BYTE_INC)
++            case MN_BYTE | MN_INC | MN_UNSIGNED: OPLABEL(op_BYTE_INC_UNSIGNED)
++                ( *( uint8_t * )ptr_from_int( sp[-1] ) ) += ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_DEC: OPLABEL(op_BYTE_DEC)
++            case MN_BYTE | MN_DEC | MN_UNSIGNED: OPLABEL(op_BYTE_DEC_UNSIGNED)
++                ( *( uint8_t * )ptr_from_int( sp[-1] ) ) -= ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_POSTDEC: OPLABEL(op_BYTE_POSTDEC)
++            case MN_BYTE | MN_POSTDEC | MN_UNSIGNED: OPLABEL(op_BYTE_POSTDEC_UNSIGNED)
++                tmp = ptr_from_int(sp[-1]);
++                ( *( uint8_t * )tmp ) -= ptr[1];
++                sp[-1] = *( uint8_t * )tmp + ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_POSTINC: OPLABEL(op_BYTE_POSTINC)
++            case MN_BYTE | MN_POSTINC | MN_UNSIGNED: OPLABEL(op_BYTE_POSTINC_UNSIGNED)
++                tmp = ptr_from_int(sp[-1]);
++                *(( uint8_t * )tmp ) += ptr[1];
++                sp[-1] = *( uint8_t * )tmp - ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_BYTE | MN_VARADD: OPLABEL(op_BYTE_VARADD)
++            case MN_BYTE | MN_VARADD | MN_UNSIGNED: OPLABEL(op_BYTE_VARADD_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) += sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARSUB: OPLABEL(op_BYTE_VARSUB)
++            case MN_BYTE | MN_VARSUB | MN_UNSIGNED: OPLABEL(op_BYTE_VARSUB_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) -= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARMUL: OPLABEL(op_BYTE_VARMUL)
++            case MN_BYTE | MN_VARMUL | MN_UNSIGNED: OPLABEL(op_BYTE_VARMUL_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) *= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARDIV: OPLABEL(op_BYTE_VARDIV)
++            case MN_BYTE | MN_VARDIV | MN_UNSIGNED: OPLABEL(op_BYTE_VARDIV_UNSIGNED)
++                if (( uint8_t )sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( uint8_t * )ptr_from_int( sp[-2] ) /= ( uint8_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARMOD: OPLABEL(op_BYTE_VARMOD)
++            case MN_BYTE | MN_VARMOD | MN_UNSIGNED: OPLABEL(op_BYTE_VARMOD_UNSIGNED)
++                if (( uint8_t )sp[-1] == 0 ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Division by zero\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *( uint8_t * )ptr_from_int( sp[-2] ) %= ( uint8_t )sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VAROR: OPLABEL(op_BYTE_VAROR)
++            case MN_BYTE | MN_VAROR | MN_UNSIGNED: OPLABEL(op_BYTE_VAROR_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) |= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARXOR: OPLABEL(op_BYTE_VARXOR)
++            case MN_BYTE | MN_VARXOR | MN_UNSIGNED: OPLABEL(op_BYTE_VARXOR_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) ^= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARAND: OPLABEL(op_BYTE_VARAND)
++            case MN_BYTE | MN_VARAND | MN_UNSIGNED: OPLABEL(op_BYTE_VARAND_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) &= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARROR: OPLABEL(op_BYTE_VARROR)
++                *( int8_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARROR | MN_UNSIGNED: OPLABEL(op_BYTE_VARROR_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) >>= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARROL: OPLABEL(op_BYTE_VARROL)
++                *( int8_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_BYTE | MN_VARROL | MN_UNSIGNED: OPLABEL(op_BYTE_VARROL_UNSIGNED)
++                *( uint8_t * )ptr_from_int( sp[-2] ) <<= sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Direct operations with variables FLOAT type */
++
++            case MN_FLOAT | MN_LETNP: OPLABEL(op_FLOAT_LETNP)
++                ( *( float * )ptr_from_int( sp[-2] ) ) = *( float * ) & sp[-1];
++                sp -= 2;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_LET : OPLABEL(op_FLOAT_LET)
++                ( *( float * )ptr_from_int( sp[-2] ) ) = *( float * ) & sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_INC: OPLABEL(op_FLOAT_INC)
++                ( *( float * )ptr_from_int( sp[-1] ) ) += ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_FLOAT | MN_DEC: OPLABEL(op_FLOAT_DEC)
++                ( *( float * )ptr_from_int( sp[-1] ) ) -= ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_FLOAT | MN_POSTDEC: OPLABEL(op_FLOAT_POSTDEC)
++                tmp = ptr_from_int(sp[-1]);
++                ( *( float * )tmp ) -= ptr[1];
++                sp[-1] = *( uint32_t * )tmp + ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_FLOAT | MN_POSTINC: OPLABEL(op_FLOAT_POSTINC)
++                tmp = ptr_from_int(sp[-1]);
++                *(( float * )tmp ) += ptr[1];
++                sp[-1] = *( uint32_t * )tmp - ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_FLOAT | MN_VARADD: OPLABEL(op_FLOAT_VARADD)
++                *( float * )ptr_from_int( sp[-2] ) += *( float * ) & sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_VARSUB: OPLABEL(op_FLOAT_VARSUB)
++                *( float * )ptr_from_int( sp[-2] ) -= *( float * ) & sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_VARMUL: OPLABEL(op_FLOAT_VARMUL)
++                *( float * )ptr_from_int( sp[-2] ) *= *( float * ) & sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            case MN_FLOAT | MN_VARDIV: OPLABEL(op_FLOAT_VARDIV)
++                *( float * )ptr_from_int( sp[-2] ) /= *( float * ) & sp[-1];
++                sp--;
++                ptr++;
++                NEXT;
++
++            /* Jumps */
++
++            case MN_JUMP: OPLABEL(op_JUMP)
++                ptr = r->code + ptr[1];
++                CONTINUE;
++
++            case MN_JTRUE: OPLABEL(op_JTRUE)
++                sp--;
++                if ( *sp ) {
++                    ptr = r->code + ptr[1];
++                    CONTINUE;
++                }
++                ptr += 2;
++                NEXT;
++
++            case MN_JFALSE: OPLABEL(op_JFALSE)
++                sp--;
++                if ( !*sp ) {
++                    ptr = r->code + ptr[1];
++                    CONTINUE;
++                }
++                ptr += 2;
++                NEXT;
++
++            case MN_JTTRUE: OPLABEL(op_JTTRUE)
++                if ( sp[-1] ) {
++                    ptr = r->code + ptr[1];
++                    CONTINUE;
++                }
++                ptr += 2;
++                NEXT;
++
++            case MN_JTFALSE: OPLABEL(op_JTFALSE)
++                if ( !sp[-1] ) {
++                    ptr = r->code + ptr[1];
++                    CONTINUE;
++                }
++                ptr += 2;
++                NEXT;
++
++            case MN_NCALL: OPLABEL(op_NCALL)
++                *sp++ = ptr - r->code + 2 ; /* Push next address */
++                ptr = r->code + ptr[1] ; /* Call function */
++                r->call_level++;
++                NEXT;
++
++            /* Switch */
++
++            case MN_SWITCH: OPLABEL(op_SWITCH)
++                r->switchval = *--sp;
++                r->cased = 0;
++                ptr++;
++                NEXT;
++
++            case MN_SWITCH | MN_STRING: OPLABEL(op_SWITCH_STRING)
++                if ( r->switchval_string != 0 ) string_discard( r->switchval_string );
++                r->switchval_string = *--sp;
++                r->cased = 0;
++                ptr++;
++                NEXT;
++
++            case MN_CASE: OPLABEL(op_CASE)
++                if ( r->switchval == *--sp ) r->cased = 2;
++                ptr++;
++                NEXT;
++
++            case MN_CASE | MN_STRING: OPLABEL(op_CASE_STRING)
++                if ( string_comp( r->switchval_string, *--sp ) == 0 ) r->cased = 2;
++                string_discard( *sp );
++                string_discard( sp[-1] );
++                ptr++;
++                NEXT;
++
++            case MN_CASE_R: OPLABEL(op_CASE_R)
++                sp -= 2;
++                if ( r->switchval >= sp[0] && r->switchval <= sp[1] ) r->cased = 1;
++                ptr++;
++                NEXT;
++
++            case MN_CASE_R | MN_STRING: OPLABEL(op_CASE_R_STRING)
++                sp -= 2;
++                if ( string_comp( r->switchval_string, sp[0] ) >= 0 &&
++                     string_comp( r->switchval_string, sp[1] ) <= 0 )
++                    r->cased = 1;
++                string_discard( sp[0] );
++                string_discard( sp[1] );
++                ptr++;
++                NEXT;
++
++            case MN_JNOCASE: OPLABEL(op_JNOCASE)
++                if ( r->cased < 1 ) {
++                    ptr = r->code + ptr[1];
++                    CONTINUE;
++                }
++                ptr += 2;
++                NEXT;
++
++            /* Process control */
++
++            case MN_TYPE: OPLABEL(op_TYPE)
++            {
++                PROCDEF * proct = procdef_get( ptr[1] );
++                if ( !proct ) {
++                    fprintf( stderr, "ERROR: Runtime error in %s(%d) - Invalid type\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    exit( 0 );
++                }
++                *sp++ = proct->type;
++                ptr += 2;
++                NEXT;
++            }
++
++            case MN_FRAME: OPLABEL(op_FRAME)
++                LOCINT32( r, FRAME_PERCENT ) += sp[-1];
++
++                sp--;
++                r->codeptr = ptr + 1;
++                return_value = LOCDWORD( r, PROCESS_ID );
++
++                if ( !( r->proc->flags & PROC_FUNCTION ) &&
++                        r->called_by && instance_exists( r->called_by ) && ( LOCDWORD( r->called_by, STATUS ) & STATUS_WAITING_MASK ) ) {
++                    /* We're returning and the parent is waiting: wake it up */
++                    if ( r->called_by->stack && ( r->called_by->stack[0] & STACK_RETURN_VALUE ) )
++                        r->called_by->stack_ptr[-1] = return_value;
++
++                    LOCDWORD( r->called_by, STATUS ) &= ~STATUS_WAITING_MASK;
++                    r->called_by = NULL;
++                }
++                goto break_all;
++
++            case MN_END: OPLABEL(op_END)
++                if ( r->call_level > 0 ) {
++                    ptr = r->code + *--sp;
++                    r->call_level--;
++                    CONTINUE;
++                }
++
++                if ( LOCDWORD( r, STATUS ) != STATUS_DEAD ) LOCDWORD( r, STATUS ) = STATUS_KILLED;
++                goto break_all;
++
++            case MN_RETURN: OPLABEL(op_RETURN)
++                if ( r->call_level > 0 ) {
++                    ptr = r->code + *--sp;
++                    r->call_level--;
++                    CONTINUE;
++                }
++
++                if ( LOCDWORD( r, STATUS ) != STATUS_DEAD ) LOCDWORD( r, STATUS ) = STATUS_KILLED;
++                sp--;
++                return_value = *sp;
++                goto break_all;
++
++            /* Handlers */
++
++            case MN_EXITHNDLR: OPLABEL(op_EXITHNDLR)
++                r->exitcode = ptr[1];
++                ptr += 2;
++                NEXT;
++
++            case MN_ERRHNDLR: OPLABEL(op_ERRHNDLR)
++                r->errorcode = ptr[1];
++                ptr += 2;
++                NEXT;
++
++            /* Others */
++
++            case MN_DEBUG: OPLABEL(op_DEBUG)
++                if ( dcb.data.NSourceFiles ) {
++                    if ( debug > 0 ) printf( "\n::: DEBUG from %s(%d)\n", r->proc->name, LOCDWORD( r, PROCESS_ID ) );
++                    trace_sentence = -1;
++                    debugger_show_console = 1;
++                }
++                ptr++;
++                NEXT;
++
++            case MN_SENTENCE: OPLABEL(op_SENTENCE)
++                trace_sentence = ptr[1];
++                trace_instance = r;
++                ptr += 2;
++                if ( debugger_trace || debugger_step ) {
++                    debugger_trace = 0;
++                    debugger_step = 0;
++                    debugger_show_console = 1;
++                }
++                NEXT;
++
++            default: OPLABEL(op_default)
++                fprintf( stderr, "ERROR: Runtime error in %s(%d) - Mnemonic 0x%02X not implemented\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), *ptr );
++                exit( 0 );
++        }
++
++#if THREADED_DISPATCH
++op_slow_next:
++        if ( sp < stack_base ) goto stack_error;
++op_slow_continue:
++        goto loop_head;
++stack_error:
++#endif
++        if ( sp < stack_base ) {
++            fprintf( stderr, "ERROR: Runtime error in %s(%d) - Critical Stack Problem StackBase=%p StackPTR=%p\n", r->proc->name, LOCDWORD( r, PROCESS_ID ), (void *)r->stack, (void *)sp );
++            exit( 0 );
++        }
++
++#ifdef EXIT_ON_EMPTY_STACK
++        if ( sp == r->stack ) {
++            r->codeptr = ptr;
++            if ( LOCDWORD( r, STATUS ) != STATUS_RUNNING && LOCDWORD( r, STATUS ) != STATUS_DEAD ) break;
++        }
++#endif
++    }
++
++    /* *** GENERAL EXIT *** */
++break_all:
++    r->stack_ptr = sp;
++
++    if ( !*ptr || *ptr == MN_RETURN || *ptr == MN_END || LOCDWORD( r, STATUS ) == STATUS_KILLED ) {
++        /* Check for waiting parent */
++        if ( r->called_by && instance_exists( r->called_by ) && ( LOCDWORD( r->called_by, STATUS ) & STATUS_WAITING_MASK ) ) {
++            /* We're returning and the parent is waiting: wake it up */
++            if ( r->called_by->stack && ( r->called_by->stack[0] & STACK_RETURN_VALUE ) )
++                r->called_by->stack_ptr[-1] = return_value;
++
++            LOCDWORD( r->called_by, STATUS ) &= ~STATUS_WAITING_MASK;
++        }
++
++        r->called_by = NULL;
++
++        /* The process should be destroyed immediately, it is a function-type one */
++        /* Run ONEXIT */
++        if (( LOCDWORD( r, STATUS ) & ~STATUS_WAITING_MASK ) != STATUS_DEAD && r->exitcode ) {
++            LOCDWORD( r, STATUS ) = STATUS_DEAD;
++            r->codeptr = r->code + r->exitcode;
++            ptr = r->codeptr;
++            goto main_loop_instance_go;
++//            instance_go( r );
++//            if ( !instance_exists( r ) ) r = NULL;
++        } else {
++            instance_destroy( r );
++            r = NULL;
++        }
++    }
++
++    /* Hook */
++    if ( r && instance_pos_execute_hook_count ) {
++        for ( n = 0; n < instance_pos_execute_hook_count; n++ )
++            instance_pos_execute_hook_list[n]( r );
++    }
++    /* Hook */
++
++    if ( r && LOCDWORD( r, STATUS ) != STATUS_KILLED && r->first_run ) r->first_run = 0;
++
++    return return_value;
++}
++
++/* ---------------------------------------------------------------------- */

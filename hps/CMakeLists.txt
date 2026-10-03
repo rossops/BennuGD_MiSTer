@@ -22,6 +22,14 @@ set(GIT_WORKING_DIR "${CMAKE_CURRENT_SOURCE_DIR}/BennuGD_libretro")
 add_compile_options(-fvisibility=hidden)
 add_subdirectory(BennuGD_libretro EXCLUDE_FROM_ALL)
 
+# Threaded dispatch in instance_go (patch 0007): LLVM merges the per-opcode
+# indirect jumps into one block and copies it back into each opcode only
+# when that block has at most 16 predecessors and successors. The
+# interpreter has 359, so lift the limits for this one file.
+set_source_files_properties(BennuGD_libretro/core/bgdrtm/src/interpreter.c
+    TARGET_DIRECTORY core
+    PROPERTIES COMPILE_FLAGS "-mllvm -tail-dup-pred-size=1000 -mllvm -tail-dup-succ-size=1000")
+
 # Upstream builds everything -fPIC for the shared core. We link it into an
 # executable, and on 32-bit ARM PIC taxes every global access in the
 # interpreter loop, so switch it off for every target in the submodule.
