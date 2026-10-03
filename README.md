@@ -2,7 +2,7 @@
 
 ![Streets of Rage Remake title screen, captured from the MiSTer's HDMI output](docs/screenshots/title.jpg)
 
-Streets of Rage Remake 5.2 on a MiSTer. The FPGA carries the video, audio
+Streets of Rage Remake 5.2 (and 5.1) on a MiSTer. The FPGA carries the video, audio
 and controller plumbing; the DE10-Nano's ARM side runs the BennuGD
 interpreter that the game was written for. It is one core, and any BennuGD
 1.x game can ride on it, but SorR is the one that has been tested.
@@ -12,7 +12,9 @@ video without tearing, pads mapped in the MiSTer OSD, steady sound through
 level transitions, saves working. Much remains to be tested. The heaviest
 scenes still run below 60 fps because the interpreter is out of CPU there,
 only one pad has been tried, only HDMI output has been checked, and other
-BennuGD games have not been tried at all. Expect rough edges and please
+BennuGD games have not been tried at all. Version 5.1 of SorR has its own
+menu entry and plays, picture and sound as good as 5.2's; it has had a
+quarter of an hour of play so far, not a playthrough. Expect rough edges and please
 report what you find.
 
 | ![Main menu](docs/screenshots/main-menu.jpg) | ![Stage 36, Dance Club](docs/screenshots/dance-club.jpg) | ![Intro](docs/screenshots/intro.jpg) |
@@ -21,42 +23,46 @@ report what you find.
 
 All captures are from the MiSTer over HDMI, through a capture card.
 
-## Installing Streets of Rage Remake 5.2
+## Installing Streets of Rage Remake 5.2 or 5.1
 
 You need a MiSTer updated during 2026 (the launch mechanism relies on a
 Main_MiSTer from this year), a display on HDMI or on the analog output
 (the core produces a normal 240p picture, so the scaler, `direct_video`
 and the analog board all work), a way to put files on the SD card (the
 network share or a card reader), and your own copy of Streets of Rage
-Remake 5.2. Nothing from the game ships with this core.
+Remake, version 5.2 or 5.1. Nothing from the game ships with this core.
 
-**1. Get the game onto the card.** On a PC, SorR 5.2 is a folder with
+**1. Get the game onto the card.** On a PC, SorR is a folder with
 `SorR.exe`, `SorR.dat`, `mod`, `palettes` and `savegame` in it. Create
-this folder on the card and copy these into it, exactly these names:
+a folder on the card named after your version, `SORRv52` for 5.2 or
+`SORRv51` for 5.1, and copy these into it, exactly these names:
 
 ```
-/media/fat/games/BennuGD/SORRv52/SorR.dat
-/media/fat/games/BennuGD/SORRv52/mod/         (whole folder)
-/media/fat/games/BennuGD/SORRv52/palettes/    (whole folder)
-/media/fat/games/BennuGD/SORRv52/savegame/    (whole folder, may be empty)
+/media/fat/games/BennuGD/SORRv52/SorR.dat          (SORRv51/ for 5.1)
+/media/fat/games/BennuGD/SORRv52/mod/              (whole folder)
+/media/fat/games/BennuGD/SORRv52/palettes/         (whole folder)
+/media/fat/games/BennuGD/SORRv52/savegame/         (whole folder, may be empty)
 ```
 
 Leave the `.exe` and `.dll` files behind, they are Windows only. The
-folder name `SORRv52` and the file name `SorR.dat` matter: the menu entry
-points at them.
+folder name and the file name `SorR.dat` matter: each menu entry points
+at its own folder. Both versions can sit on the card side by side; each
+keeps its own `savegame` folder, and a save from one version does not
+work in the other.
 
-This is the file that was tested. Check yours before going further; a
-different version or a modded `.dat` is untested here:
+These are the files that were tested. Check yours before going further;
+a different build or a modded `.dat` is untested here:
 
 | file | size | CRC32 | MD5 |
 |---|---|---|---|
 | `SorR.dat` (v5.2) | 320,091,685 bytes | `1b1d6221` | `bce446c9c5bd86cc345a01917967e404` |
+| `SorR.dat` (v5.1) | 253,705,647 bytes | `3a19d4c2` | `2e10aec879bdb9c398ffdab9e44433be` |
 
 On the MiSTer over ssh: `md5sum /media/fat/games/BennuGD/SORRv52/SorR.dat`.
 On a PC, any checksum tool will do (7-Zip's CRC option, or `certutil
 -hashfile SorR.dat MD5` on Windows).
 
-**2. Set the game's display mode.** Open
+**2. Set the game's display mode (5.2 only).** Open
 `/media/fat/games/BennuGD/SORRv52/mod/system.txt` in a text editor. Under
 the line `// FULL SCREEN WIDE: AUTO, DESKTOP, BORDERLESS, BORDERLESS_SYNC`
 make sure the value is
@@ -66,7 +72,20 @@ BORDERLESS_SYNC
 ```
 
 This is the mode that renders at the game's native size. The others make
-the game upscale in software, which the ARM cannot afford.
+the game upscale in software, which the ARM cannot afford. The 5.1
+`system.txt` is an older format without this line (`system = PC;` and
+`loading = POST;`); leave it as it comes.
+
+**Installing 5.1 instead of 5.2.** Same steps, with these differences:
+the folder is `SORRv51`, step 2 does not apply, and the first time the
+game runs go into its Options and set graphics mode 1x: 5.1 comes up at
+640x480, upscaled by the game in software, and 1x brings it back to its
+native 320x240. The pad buttons you set in the MiSTer OSD say which
+physical button is A, B, Start and so on; what the game does with them
+is its own setting, so if Start (pause) does nothing in 5.1, bind it
+under the game's Options, Controls. A save made with 5.2 does not work
+in 5.1 or the other way round. The 5.1 file that was tested is the second
+row of the table above (MD5 `2e10aec879bdb9c398ffdab9e44433be`).
 
 **3. Unpack the release.** Download `BennuGD_MiSTer_alpha_<date>.zip (the newest one)` from
 the Releases page and unzip it onto the root of the SD card. It creates:
@@ -84,7 +103,7 @@ MiSTer.ini, registers the small launcher daemon in
 card is touched. (If you prefer ssh: `sh /media/fat/bennugd/install.sh`.)
 
 **5. Play.** In the MiSTer menu go to Other, then BennuGD, then
-SoRR 5.2. The game takes a few seconds to load. Press F12 or the menu
+SoRR 5.2 or SoRR 5.1. The game takes a few seconds to load. Press F12 or the menu
 button on the pad to open the OSD and map your pad under "define buttons"
 (A B X Y L R Select Start). Inside the game's own options choose graphics
 mode 1x / normal (the MiSTer scaler does the upscaling) and widescreen
@@ -95,8 +114,8 @@ the game.
 Saves go to the game's own `savegame` folder, as on a PC. Wait a moment
 after a save before powering off; the card is flushed when the game
 stops. To test the whole game without playing it through, `saves/` has
-an everything-unlocked profile and the steps to install it (back up your
-own save first).
+an everything-unlocked profile for 5.2 and the steps to install it (back
+up your own save first). There is no such profile for 5.1.
 
 ## Updating with update_all
 

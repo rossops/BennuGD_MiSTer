@@ -3,6 +3,10 @@
 These are here so you can reach every part of a game without playing it
 through first. They are for testing the core; they will spoil the game.
 
+These saves are for Streets of Rage Remake 5.2 only. The 5.1 save file
+has a different layout (1712 bytes against 1764), so do not copy these
+into a `SORRv51` folder; 5.1 starts from its own `savegame` folder.
+
 ## SORRv52: everything unlocked
 
 `SORRv52/savegame.sor` is a Streets of Rage Remake 5.2 profile with the

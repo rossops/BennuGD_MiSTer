@@ -642,3 +642,25 @@ narrower surfaces are centred (`FB_W`/`FB_H` in main.c, `FB_WIDTH`/
   profile was trained on the light sequence, so PGO is the first suspect
   (`PGO=off hps/build.sh` to test). The top-up removes the underruns
   either way.
+
+## 2026-10-02: Streets of Rage Remake 5.1
+
+Second game entry, same runtime: `dist/mgl/SoRR 5.1.mgl` points at
+`SORRv51/SorR.dat`; nothing in the frontend, daemon or installer changed.
+The 5.1 `SorR.dat` (253,705,647 bytes, CRC32 3a19d4c2, MD5
+2e10aec879bdb9c398ffdab9e44433be) is a DCB 0x0710 like 5.2's. Its
+`mod/system.txt` is the older `system = PC; loading = POST;` format with
+no FULL SCREEN WIDE line, so patch 0003's BORDERLESS_SYNC story does not
+apply; the game reports 320x200, then 320x240, then 640x480 `av info`
+during the intro, so it upscales in software unless its Options say 1x.
+Headless run on the device (`fb=0 audio=none frames=900 dump_dir=`, while
+an arcade core was loaded): loads in 1.3 s, intro frames correct, intro
+p50 3.2 ms at 640x480. Then launched through the .mgl (`load_core` over
+/dev/MiSTer_cmd) and played by the user for 14 minutes: picture and sound
+fine, graphics mode 1x in the game's Options switches the geometry to
+320x240 (fbcopy 0.33 ms), 0 dropped frames, clean exit on the chord. The
+pad's Start did nothing in the game: the OSD map delivers it as joystick
+button 7, so it is the game's own Controls binding (a fresh 5.1 save).
+The 5.1 save (1712 bytes) has a different layout from 5.2's (1764), so
+the unlocked test saves are 5.2 only. Loading the core's .rbf directly
+(no .mgl) still falls back to bennugd.cfg's game=, i.e. 5.2.
