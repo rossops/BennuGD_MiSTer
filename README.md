@@ -227,4 +227,13 @@ explained in the patch files). FPGA side, with Quartus 17.0 Lite:
 - The code in this repository was written with Claude Code, measured on
   the hardware at every step, and steered by Ross Esposito.
 
+### Special thanks
+
+**jonlad1** and **lucaslbds** on GitHub tested this core from the first
+alpha on, on their own MiSTers and setups, and kept coming back with
+logs, numbers and patient answers to follow-up questions. The direct
+video fix, the network-share support and the frame-copy and audio work
+all started from what they reported. They made a real difference to how
+this core turned out, and they are still around helping. Thank you both.
+
 GPL-2.0-or-later, like the framework and the engine.
