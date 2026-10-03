@@ -713,3 +713,29 @@ input_event records, which the frontend reads as the keyboard):
 - The frontend sometimes finds no "MiSTer virtual input" keyboard device
   (instances started after a core switch), while instances started at boot
   do; Main seems to recreate it. Not investigated.
+
+## 2026-10-03 evening: input-to-sound lag, audio_ms=
+
+The user hears the menu sound land late (about 110 ms after the press).
+The core's SDL audio backend is a pull model (sdl_libretro_runaudio asks
+the mixer for exactly one frame's worth per retro_run), so the 2048-frame
+"chunk size" the game passes to Mix_OpenAudio buffers nothing; the lag is
+the ALSA queue plus one frame. Made the queue depth an option
+(`audio_ms=`, audio.c: the ALSA buffer is now queue + 1024 frames of
+headroom, the level is held at the queue by the blocking writes, and the
+top-up refills whenever the level is a frame below target instead of a
+whole chunk below, which is what made small queues useless: at 50 ms the
+old threshold left 19 ms of cover). Heavy attract run on 5.2, 200 s,
+underruns beyond the 2 at load:
+
+  | queue             | underruns | top-ups | level (incl. ~10 ms sink) |
+  |-------------------|-----------|---------|---------------------------|
+  | old code, 100 ms  | 2         | 81      | 93 ms                     |
+  | 90 ms (default)   | 1         | 62      | 104-109 ms                |
+  | 60 ms             | 2         | 60      | 74-77 ms                  |
+  | 50 ms             | 3         | 59      | 66 ms                     |
+
+The remaining underruns are the 45 ms frames of the heaviest stage. The
+user prefers lag over hiccups, so the default stays at 90 and 60 is
+documented as the opt-in. Also: a frontend stopped by a signal now exits
+3 so the daemon restarts it (exit 0 means the game quit by itself).

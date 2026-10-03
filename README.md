@@ -164,6 +164,14 @@ software, which the ARM cannot keep up with; set `BORDERLESS_SYNC` in
 1x / normal in the game's own options. The heaviest scenes still drop
 frames on the stock 800 MHz CPU; that is the known limit right now.
 
+**Sound lags behind the action.** About a tenth of a second, by design:
+the frontend keeps 90 ms of sound queued so that a slow frame on a heavy
+level does not leave a gap. `audio_ms=60` in `/media/fat/bennugd/bennugd.cfg`
+brings the sound 30 ms closer, at the price of a hiccup or two per few
+minutes on the busiest stages (measured: 2 in 200 s where 90 gives 1);
+`audio_ms=50` takes another 10 ms and adds another hiccup. Restart the
+game after changing it.
+
 **The OSD's Core Volume does nothing.** MiSTer applies it to the FPGA
 core's own audio, before the Linux audio is mixed in, so it cannot reach
 this game's sound. The frontend reads the value MiSTer saves and applies

@@ -28,7 +28,7 @@ void video_close(void);
 /* audio.c: dev is an ALSA device name ("default"); NULL or "none" disables.
  * Input is interleaved S16 stereo at in_rate; writes block, so the ALSA
  * buffer paces the game alongside the frame timer. */
-int      audio_init(const char *dev, unsigned in_rate);
+int      audio_init(const char *dev, unsigned in_rate, unsigned queue_ms);   /* queue_ms 0: default */
 void     audio_push(const int16_t *lr, size_t frames);
 void     audio_flush(void);
 void     audio_topup(void (*mix)(void));   /* refill the queue through the core's audio callback when the game is behind */

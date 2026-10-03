@@ -13,7 +13,9 @@
 #include <unistd.h>
 
 #define ACC_MAX     16384u    /* input frames buffered between flushes */
-#define BUFFER_MS   100u      /* ALSA buffer: rides over the 20-30 ms frame spikes seen in play */
+#define QUEUE_MS    90u       /* queued audio, default (audio_ms= in bennugd.cfg): it is the lag
+                               * from an action to its sound, and the cushion over slow frames */
+#define HEADROOM    1024u     /* ALSA buffer beyond the queue level: room for one top-up chunk */
 #define PERIOD_MS   4u        /* small period: writes block a few ms at a time, so the game paces
                                  frame by frame instead of in bursts (bursts drop frames at the flip) */
 
@@ -86,8 +88,9 @@ static void prefill(void)
     }
 }
 
-int audio_init(const char *dev, unsigned rate)
+int audio_init(const char *dev, unsigned rate, unsigned queue_ms)
 {
+    if (!queue_ms) queue_ms = QUEUE_MS;
     if (!dev || !strcmp(dev, "none")) { host_log("audio: disabled"); return 0; }
     lib = dlopen("libasound.so.2", RTLD_NOW);
     if (!lib) { host_log("audio: libasound.so.2 not found"); return -1; }
@@ -118,7 +121,7 @@ int audio_init(const char *dev, unsigned rate)
     if (err < 0) { host_log("audio: open %s: %s", dev, p_strerror(err)); pcm = NULL; return -1; }
     snd_pcm_hw_params_t *hw;
     unsigned r = rate; int dir = 0;
-    unsigned long buf = (unsigned long)rate * BUFFER_MS / 1000, per = (unsigned long)rate * PERIOD_MS / 1000;
+    unsigned long buf = (unsigned long)rate * queue_ms / 1000 + HEADROOM, per = (unsigned long)rate * PERIOD_MS / 1000;
     if (p_hw_malloc(&hw) < 0) { p_close(pcm); pcm = NULL; return -1; }
 retry:
     if ((err = p_hw_any(pcm, hw)) < 0 ||
@@ -133,14 +136,16 @@ retry:
         /* seen once right after boot (EINVAL): the card was not ready yet */
         static int attempts;
         host_log("audio: hw params: %s (attempt %d)", p_strerror(err), attempts + 1);
-        if (++attempts < 5) { sleep(1); r = rate; buf = (unsigned long)rate * BUFFER_MS / 1000; per = (unsigned long)rate * PERIOD_MS / 1000; goto retry; }
+        if (++attempts < 5) { sleep(1); r = rate; buf = (unsigned long)rate * queue_ms / 1000 + HEADROOM; per = (unsigned long)rate * PERIOD_MS / 1000; goto retry; }
         p_hw_free(hw); p_close(pcm); pcm = NULL; return -1;
     }
     p_hw_free(hw);
-    prefill_frames = (unsigned)(buf - 2 * per);
+    /* The level the queue is held at. The blocking writes in audio_flush cap
+     * it at buf - 735 (one frame above it), regulate() trims it back down. */
+    prefill_frames = (unsigned)(buf - HEADROOM);
     prefill();
-    host_log("audio: %s, %u Hz S16 stereo, buffer %lu frames (%lu ms), period %lu frames, primed %u",
-             dev, r, buf, buf * 1000 / r, per, prefill_frames);
+    host_log("audio: %s, %u Hz S16 stereo, buffer %lu frames (%lu ms), period %lu frames, queue %u frames (%u ms)",
+             dev, r, buf, buf * 1000 / r, per, prefill_frames, prefill_frames * 1000 / r);
     return 0;
 }
 
@@ -199,7 +204,7 @@ void audio_flush(void)
  * retro_run, however long that run took. In a heavy scene at 17-18 ms a
  * frame the queue drains by a millisecond or two per frame, underruns
  * every few seconds and restarts with 90 ms of silence: the "crackle on
- * busy levels". When the queue has fallen a chunk below the primed level,
+ * busy levels". When the queue has fallen a frame below the primed level,
  * have the core mix extra chunks (its RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK
  * entry, 1024 frames each, delivered through audio_push) until it is back
  * near the target. The music then plays on at the right speed and only
@@ -211,7 +216,9 @@ void audio_topup(void (*mix)(void))
     for (int i = 0; i < 8; i++) {
         long d;
         if (p_delay(pcm, &d) < 0) return;
-        if (d >= (long)prefill_frames - 1024) return;
+        /* a frame below the level: a slow frame drained it, put a chunk back
+         * (the chunk fits: HEADROOM above the level is reserved for it) */
+        if (d >= (long)prefill_frames - 735) return;
         mix();
         if (!acc_n) return;            /* the core had nothing for us */
         topups++;

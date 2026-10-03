@@ -39,6 +39,7 @@ static struct {
     unsigned long fb;
     int dump_every, frames, menu, fps;
     int preread;                    /* MB/s for the page-cache pre-read; -1 auto, 0 off */
+    int audio_ms;                   /* audio_ms= ALSA queue depth, 0 = audio.c default */
     int cpu;                    /* cpu= MHz, 0 leaves the clock alone */
     struct { char *key, *val; } vars[MAX_VARS];
     int nvars;
@@ -99,6 +100,7 @@ static int apply_setting(const char *key, const char *val)
     else if (!strcmp(key, "menu")) opt.menu = atoi(val);
     else if (!strcmp(key, "fps")) opt.fps = atoi(val);
     else if (!strcmp(key, "preread")) opt.preread = atoi(val);
+    else if (!strcmp(key, "audio_ms")) { opt.audio_ms = atoi(val); if (opt.audio_ms < 20 || opt.audio_ms > 500) opt.audio_ms = 0; }
     else if (!strcmp(key, "prof")) opt.prof = strdup(val);
     else if (!strcmp(key, "cpu")) opt.cpu = atoi(val);
     else if (!strncmp(key, "opt.", 4)) set_var(key + 4, val);
@@ -281,7 +283,7 @@ static void usage(void)
     fprintf(stderr,
         "usage: bennugd <game.dat|--core> [key=value ...]\n"
         "  game= log= audio=(default|none|<alsa device>) fb=0x22000000|0 dump_dir= dump_every=N\n"
-        "  frames=N menu=0|1 prof=<dump file> fps=0|1 preread=<MB/s|0> cpu=800|1000|1200 opt.<core option>=<value>\n");
+        "  frames=N menu=0|1 prof=<dump file> fps=0|1 preread=<MB/s|0> audio_ms=<20..500> cpu=800|1000|1200 opt.<core option>=<value>\n");
 }
 
 int main(int argc, char **argv)
@@ -359,7 +361,7 @@ int main(int argc, char **argv)
     unsigned arate = (unsigned)av.timing.sample_rate;
     if (video_has_vsync() && av.timing.fps > 1.0)
         arate = (unsigned)(av.timing.sample_rate * video_vblank_hz() / av.timing.fps + 0.5);
-    audio_init(opt.audio, arate);
+    audio_init(opt.audio, arate, (unsigned)opt.audio_ms);
     input_init(!core_mode);   /* beside Main_MiSTer, leave the devices shared so its OSD keeps working */
 
     prewarm_file(opt.game, opt.preread);
@@ -412,5 +414,5 @@ int main(int argc, char **argv)
     launcher_restore_cpu();
     if (gfd >= 0) close(gfd);
     if (opt.menu && stop != 2) launcher_return_to_menu();
-    return 0;
+    return stop == 2 ? 3 : 0;       /* 3: stopped from outside, the daemon restarts us; 0: the game quit */
 }
