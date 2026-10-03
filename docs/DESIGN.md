@@ -739,3 +739,31 @@ The remaining underruns are the 45 ms frames of the heaviest stage. The
 user prefers lag over hiccups, so the default stays at 90 and 60 is
 documented as the opt-in. Also: a frontend stopped by a signal now exits
 3 so the daemon restarts it (exit 0 means the game quit by itself).
+
+## 2026-10-03 night: PGO off by default
+
+The 10-02 A/B left PGO as the first suspect for the heavy-stage slowdown.
+Tested it with an A-B-A run on the attract recipe (frontend restarted
+from attract, 200 s, `run p50` averaged over frames 6600-9000, the heavy
+stage):
+
+| binary                 | run p50  | run p99  | frame+audio p50 | top-ups in the stage |
+|------------------------|----------|----------|-----------------|----------------------|
+| PGO (alpha-20261003c)  | 15.51 ms | ~25.8 ms | 16.7-16.8 ms    | 47                   |
+| `PGO=off`              | 14.26 ms | ~23.5 ms | 16.1 ms         | 3                    |
+| PGO again              | 15.59 ms | ~26.5 ms | 16.7-16.9 ms    | 53                   |
+
+The two PGO passes agree within 0.5 %, so the 8 % is real. Light windows
+(frames 1200-5400, 9600-12000) come out even within about 1 %. The profile
+was trained on the light sequence of 09-19, and it pessimised the paths
+the heavy stage actually takes. `hps/build.sh` now builds without PGO
+unless `PGO=use PGO_PROFILE=...` is given, and that mode always gets its
+own build tree. Careful with an existing local tree: CMake caches the
+flags from the first configure, so the old default tree kept
+`-fprofile-instr-use` until its CMakeCache.txt was deleted. The profile
+and the vendored runtime stay in `hps/pgo/` in case a profile trained on
+a heavy stage is worth another try.
+
+Also checked while there: the `switch` in instance_go compiles to one
+jump table behind a single `add pc` (plus a bounds check per opcode).
+That is the next target (direct-threaded dispatch).

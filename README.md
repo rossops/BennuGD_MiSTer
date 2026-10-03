@@ -214,9 +214,9 @@ ends, in the order they happened.
 
 ## Building
 
-ARM side, on a Mac or Linux box with zig 0.14.0 and cmake (the build uses
-the profile in `hps/pgo/` for profile-guided optimisation; `hps/pgo/README.md`
-explains how to regenerate it):
+ARM side, on a Mac or Linux box with zig 0.14.0 and cmake (profile-guided
+optimisation is opt-in, see `hps/pgo/README.md`; the committed profile made
+heavy stages slower):
 
     hps/build.sh              # -> hps/out/bennugd
 
