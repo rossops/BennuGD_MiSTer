@@ -76,16 +76,27 @@ the game upscale in software, which the ARM cannot afford. The 5.1
 `system.txt` is an older format without this line (`system = PC;` and
 `loading = POST;`); leave it as it comes.
 
-**Installing 5.1 instead of 5.2.** Same steps, with these differences:
-the folder is `SORRv51`, step 2 does not apply, and the first time the
-game runs go into its Options and set graphics mode 1x: 5.1 comes up at
-640x480, upscaled by the game in software, and 1x brings it back to its
-native 320x240. The pad buttons you set in the MiSTer OSD say which
-physical button is A, B, Start and so on; what the game does with them
-is its own setting, so if Start (pause) does nothing in 5.1, bind it
-under the game's Options, Controls. A save made with 5.2 does not work
-in 5.1 or the other way round. The 5.1 file that was tested is the second
-row of the table above (MD5 `2e10aec879bdb9c398ffdab9e44433be`).
+**Installing 5.1 instead of 5.2.** Same steps, with these differences.
+The folder is `SORRv51` and step 2 does not apply. Before the first
+start, put the 5.1 starter save in place: download
+`SORRv51_starter_save.zip` from the Releases page (or take it from
+`saves/SORRv51/` here) and copy its `savegame.sor` into
+`/media/fat/games/BennuGD/SORRv51/savegame/`. A 5.1 profile made from
+scratch only listens to the keyboard: its language screen ignores the
+pad, the pad only wakes up once the game's Controls screen has been
+visited, and its default pause button is one the OSD map cannot reach.
+The starter save is a clean profile with no progress, the pad bound to
+the MiSTer layout (A attack, B special, X special combo, Y jump, L
+series, R back attack, Select police, Start pause) and graphics mode 1x,
+which keeps the picture at the game's native 320x240 instead of a
+software-upscaled 640x480. Without it you need a USB keyboard for the
+first run: arrows and Enter through the language and profile screens,
+then Options, Controls, bind Start, and graphics mode 1x; then hold
+Start on the pad for three seconds so the game quits and writes the
+save. A save made with
+5.2 does not work in 5.1 or the other way round. The 5.1 file that was
+tested is the second row of the table above (MD5
+`2e10aec879bdb9c398ffdab9e44433be`).
 
 **3. Unpack the release.** Download `BennuGD_MiSTer_alpha_<date>.zip (the newest one)` from
 the Releases page and unzip it onto the root of the SD card. It creates:
@@ -107,15 +118,17 @@ SoRR 5.2 or SoRR 5.1. The game takes a few seconds to load. Press F12 or the men
 button on the pad to open the OSD and map your pad under "define buttons"
 (A B X Y L R Select Start). Inside the game's own options choose graphics
 mode 1x / normal (the MiSTer scaler does the upscaling) and widescreen
-as you like. Select+Start together on the pad, or End on a keyboard,
-returns to the MiSTer menu. Loading another core from the OSD also stops
-the game.
+as you like. To leave, hold Start on the pad for three seconds (or press
+Select+Start together): the frontend presses the game's own quit key for
+it, the game writes its save and the MiSTer menu comes back. Loading
+another core from the OSD also stops the game, but then the game does not
+get to write its save.
 
 Saves go to the game's own `savegame` folder, as on a PC. Wait a moment
 after a save before powering off; the card is flushed when the game
 stops. To test the whole game without playing it through, `saves/` has
 an everything-unlocked profile for 5.2 and the steps to install it (back
-up your own save first). There is no such profile for 5.1.
+up your own save first), and the 5.1 starter save described above.
 
 ## Updating with update_all
 

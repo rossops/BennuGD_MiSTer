@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MAX_DEVS 16
@@ -27,6 +28,13 @@ static uint16_t pad_bits[PORTS];       /* 1 << RETRO_DEVICE_ID_JOYPAD_x */
 static uint16_t stick_bits[PORTS];     /* left stick as d-pad */
 static uint8_t  keys[KEY_MAX + 1];
 static bool     quit;
+/* Leaving the game. Its own quit key (F12 in Streets of Rage Remake) is the
+ * only path on which it writes its save file, so the exit gestures press
+ * that key for it and let it shut down through RETRO_ENVIRONMENT_SHUTDOWN;
+ * a game that has not gone after a few seconds is stopped the hard way. */
+static int      exit_key_frames;        /* F12 presented to the game for this many polls */
+static int64_t  exit_deadline_us;       /* then the hard stop */
+static int64_t  start_held_since_us;    /* Start held continuously since; 0 when up */
 static uint16_t fpga_pad(unsigned port);
 static int      log_presses = 40;   /* first presses go to the log: mapping questions answer themselves */
 
@@ -154,6 +162,20 @@ static void set_bit(uint16_t *w, int id, bool on)
     if (on) *w |= BIT(id); else *w &= (uint16_t)~BIT(id);
 }
 
+static int64_t now_us(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+static void request_exit(const char *why, int64_t now)
+{
+    if (exit_deadline_us) return;
+    host_log("input: %s: pressing F12 for the game (its own quit, which writes its save)", why);
+    exit_key_frames = 20;
+    exit_deadline_us = now + 5000000;
+}
+
 static void handle(struct dev *dv, const struct input_event *ev)
 {
     if (ev->type == EV_KEY) {
@@ -196,22 +218,36 @@ void input_poll(void)
 {
     struct pollfd pf[MAX_DEVS];
     for (int i = 0; i < ndevs; i++) { pf[i].fd = devs[i].fd; pf[i].events = POLLIN; }
-    if (poll(pf, ndevs, 0) <= 0) return;
-    for (int i = 0; i < ndevs; i++) {
-        if (!(pf[i].revents & POLLIN)) continue;
-        struct input_event ev[32];
-        ssize_t n;
-        while ((n = read(devs[i].fd, ev, sizeof ev)) > 0)
-            for (size_t k = 0; k < n / sizeof ev[0]; k++) handle(&devs[i], &ev[k]);
+    if (poll(pf, ndevs, 0) > 0) {
+        for (int i = 0; i < ndevs; i++) {
+            if (!(pf[i].revents & POLLIN)) continue;
+            struct input_event ev[32];
+            ssize_t n;
+            while ((n = read(devs[i].fd, ev, sizeof ev)) > 0)
+                for (size_t k = 0; k < n / sizeof ev[0]; k++) handle(&devs[i], &ev[k]);
+        }
     }
-    /* exit chord: the two small centre buttons together. Select+Start on a
-     * gamepad; on a joystick-class pad those are buttons 9+10, which the
-     * passthrough map above exposes as L3+R3. */
+    /* Exit gestures, checked every poll: the pad mapped in the OSD arrives
+     * through the FPGA words, which raise no evdev event. Start held for
+     * three seconds, or the two small centre buttons together (Select+Start
+     * on a gamepad; buttons 9+10 on a joystick-class pad, which the
+     * passthrough map above exposes as L3+R3). */
+    int64_t now = now_us();
+    bool start_held = false;
     for (int p = 0; p < PORTS; p++) {
         uint16_t b = pad_bits[p] | stick_bits[p] | fpga_pad(p);
         const uint16_t ss = BIT(RETRO_DEVICE_ID_JOYPAD_SELECT) | BIT(RETRO_DEVICE_ID_JOYPAD_START);
         const uint16_t js = BIT(RETRO_DEVICE_ID_JOYPAD_L3) | BIT(RETRO_DEVICE_ID_JOYPAD_R3);
-        if ((b & ss) == ss || (b & js) == js) quit = true;
+        if ((b & ss) == ss || (b & js) == js) request_exit("Select+Start", now);
+        if (b & BIT(RETRO_DEVICE_ID_JOYPAD_START)) start_held = true;
+    }
+    if (!start_held) start_held_since_us = 0;
+    else if (!start_held_since_us) start_held_since_us = now;
+    else if (now - start_held_since_us >= 3000000) request_exit("Start held for 3 s", now);
+    if (exit_key_frames > 0) exit_key_frames--;
+    if (exit_deadline_us && now >= exit_deadline_us) {
+        host_log("input: the game did not quit on F12, stopping it");
+        quit = true;
     }
 }
 
@@ -244,6 +280,7 @@ int16_t input_state(unsigned port, unsigned device, unsigned index, unsigned id)
         return id < 16 && (b & BIT(id)) ? 1 : 0;
     }
     if (device == RETRO_DEVICE_KEYBOARD && port == 0) {
+        if (id == RETROK_F12 && exit_key_frames > 0) return 1;
         for (size_t i = 0; i < sizeof key_map / sizeof *key_map; i++)
             if ((unsigned)key_map[i].rk == id) return keys[key_map[i].ek];
     }

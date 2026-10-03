@@ -53,6 +53,8 @@ jobs:
           # a save must be a deliberate copy over the player's own
           (cd saves && zip -qr "$GITHUB_WORKSPACE/SORRv52_unlocked_saves.zip" README.md SORRv52)
           unzip -l SORRv52_unlocked_saves.zip
+          (cd saves && zip -qr "$GITHUB_WORKSPACE/SORRv51_starter_save.zip" README.md SORRv51)
+          unzip -l SORRv51_starter_save.zip
 
       - uses: actions/upload-artifact@v4
         with:
@@ -69,3 +71,4 @@ jobs:
             ${{ steps.pkg.outputs.zip }}
             ${{ steps.pkg.outputs.rbf }}
             SORRv52_unlocked_saves.zip
+            SORRv51_starter_save.zip

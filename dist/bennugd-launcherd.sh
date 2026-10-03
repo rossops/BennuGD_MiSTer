@@ -58,12 +58,19 @@ for p in $(pidof bennugd 2>/dev/null | tr ' ' '\n' | sort -n); do   # lowest pid
 done
 while :; do
     core=$(cat /tmp/CORENAME 2>/dev/null)
-    # a crashed frontend leaves a black screen with the core still loaded: restart it
+    # a crashed frontend leaves a black screen with the core still loaded: restart it.
+    # Exit 0 is the game quitting by itself (the Start-hold gesture presses its
+    # quit key); the frontend then asks Main for the menu, so leave it alone.
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
         wait "$pid" 2>/dev/null; st=$?
         sync
-        log "frontend pid $pid died (exit $st, see bennugd.log), restarting"
-        pid=""; last_game="(restart)"
+        if [ "$st" = 0 ]; then
+            log "frontend pid $pid exited cleanly (the game quit)"
+            pid=""
+        else
+            log "frontend pid $pid died (exit $st, see bennugd.log), restarting"
+            pid=""; last_game="(restart)"
+        fi
     fi
     game=""
     if [ "$core" = "BennuGD" ]; then

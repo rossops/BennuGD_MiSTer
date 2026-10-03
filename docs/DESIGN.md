@@ -664,3 +664,50 @@ button 7, so it is the game's own Controls binding (a fresh 5.1 save).
 The 5.1 save (1712 bytes) has a different layout from 5.2's (1764), so
 the unlocked test saves are 5.2 only. Loading the core's .rbf directly
 (no .mgl) still falls back to bennugd.cfg's game=, i.e. 5.2.
+
+### 2026-10-03: the first-run report, and the 5.1 starter save
+
+An emailed report: 5.1 loads to the language screen and the pad does
+nothing there. Reproduced with an empty `savegame` folder. Findings,
+driving the game with key presses written to `/dev/input/event1` (16-byte
+input_event records, which the frontend reads as the keyboard):
+- A profile made from scratch only listens to the keyboard. Its joystick
+  defaults exist (Controls screen: JOY 0-6 for the seven actions, JOY 8
+  for pause) but only come alive once that screen has been visited.
+- The core's SDL joystick numbering is the `vbt[]` table in
+  SDL_sysjoystick.c, not the "Joy N" descriptor labels: SDL buttons 0-7 are
+  B A Y X L R Select Start in MiSTer terms, 8-9 L3 R3. So the defaults
+  map A attack, B special, X special combo, Y jump, L series, R back
+  attack, Select police, and pause lands on L3, which the OSD map has no
+  slot for. That was the "Start does nothing" of the night before, on the
+  Windows save too.
+- The game writes `savegame.sor` on profile creation and on its own exit
+  (F12, which the frontend forwards; the libretro shutdown then returns
+  to the menu). It does not write on option changes or on SIGTERM.
+- Layout learned by diffing those writes: 0x3d4 gamepad pause button
+  (plain number, 8 -> 7), 0x41c graphics mode (1 -> 0 for 1x, with
+  0x3ac and 0x458 changing alongside), 0x394 an exit counter, 0x49c-0x4c4
+  the gamepad block (117-120 directions, 103 + button for the rest, same
+  offsets as 5.2's), 0x378 something else (111 in every file; patching it
+  did nothing).
+- `saves/SORRv51/savegame.sor` is the game's own write after Start -> JOY
+  7 and graphics 1x on a fresh profile; relaunching on it comes up at
+  320x240 with the pad live. Shipped as SORRv51_starter_save.zip.
+- Also seen: the daemon restarts the frontend when the OSD file browser
+  is open (Main rewrites /tmp/FULLPATH with the browsed directory on every
+  listing), and the user could not trigger the Select+Start exit chord in
+  5.1; neither is fixed yet.
+- Exit gesture (frontend, input.c): Start held 3 s, or Select+Start, now
+  presses F12 for the game (RETRO_DEVICE_KEYBOARD) for 20 polls and arms a
+  5 s hard stop; the game quits through RETRO_ENVIRONMENT_SHUTDOWN, having
+  written its save, and the frontend asks for the menu. The gesture check
+  moved out of the evdev-events branch of input_poll: an OSD-mapped pad
+  arrives through the FPGA words and raises no evdev event, so the old
+  chord only ran when some other event happened to arrive, which is why
+  Select+Start seemed dead. Verified on the device: hold -> F12 -> quit in
+  25 ms, save written, menu back. Daemon: exit 0 no longer restarts.
+- Seen once, cause unknown: OSD frozen and no pad input while the game kept
+  running its attract (Main wedged, the frontend fine); power cycle fixed it.
+- The frontend sometimes finds no "MiSTer virtual input" keyboard device
+  (instances started after a core switch), while instances started at boot
+  do; Main seems to recreate it. Not investigated.

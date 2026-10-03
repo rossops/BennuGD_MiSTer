@@ -3,9 +3,30 @@
 These are here so you can reach every part of a game without playing it
 through first. They are for testing the core; they will spoil the game.
 
-These saves are for Streets of Rage Remake 5.2 only. The 5.1 save file
-has a different layout (1712 bytes against 1764), so do not copy these
-into a `SORRv51` folder; 5.1 starts from its own `savegame` folder.
+## SORRv51: a clean profile with the pad bound
+
+`SORRv51/savegame.sor` is a fresh Streets of Rage Remake 5.1 profile, no
+progress, written by the game itself on the MiSTer. It exists because a
+5.1 profile made from scratch only listens to the keyboard: the language
+screen ignores the pad, the pad only comes alive once the game's Controls
+screen has been visited, and its default pause button (JOY 8) is one the
+MiSTer OSD map cannot reach. This file has the gamepad defaults active,
+pause moved to JOY 7 (the MiSTer Start button) and graphics mode 1x. On
+the pad: A attack, B special, X special combo, Y jump, L series, R back
+attack, Select police, Start pause.
+
+Install: copy it to `/media/fat/games/BennuGD/SORRv51/savegame/` before
+the first start (or over a profile you do not mind losing; the file
+holds progress and options together). The 5.1 file is 1712 bytes; it
+does not work in 5.2 and the 5.2 saves below do not work in 5.1.
+
+What is known of it, from diffing the game's own writes: 0x3d4 is the
+gamepad pause button (plain button number), 0x41c the graphics mode (0
+is 1x, 1 the upscaled mode), 0x49c to 0x4c4 the gamepad directions and
+the other seven actions (117 to 120, then 103 + button), 0x394 a counter
+that goes up on every exit. The game writes the file when a profile is
+created and when it quits by itself (F12 on a keyboard), not when the
+frontend is stopped.
 
 ## SORRv52: everything unlocked
 
@@ -33,9 +54,9 @@ or copy the `savegame` folder somewhere safe over the network share.
 
 ### Install
 
-1. Stop the game if it is running (Select+Start on the pad returns to
-   the MiSTer menu). The game rewrites its save files on exit, so a copy
-   made while it runs can be overwritten.
+1. Stop the game if it is running (hold Start on the pad for three
+   seconds; the MiSTer menu comes back). The game rewrites its save files
+   on exit, so a copy made while it runs can be overwritten.
 2. Copy `savegame.sor` and `trophies.sor` into
    `/media/fat/games/BennuGD/SORRv52/savegame/`, replacing the ones there.
 3. Launch the game from Other -> BennuGD -> SoRR 5.2. Check the Shop and
