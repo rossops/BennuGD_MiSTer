@@ -74,10 +74,20 @@ while :; do
     fi
     game=""
     if [ "$core" = "BennuGD" ]; then
-        game=$(resolve_game)
-        if [ "$core" != "$last_core" ] && [ -z "$game" ]; then
-            n=0   # an .mgl mounts its file after its delay: give it a few seconds
-            while [ $n -lt 8 ] && [ -z "$game" ]; do sleep 0.5; n=$((n + 1)); game=$(resolve_game); done
+        if [ "$core" != "$last_core" ]; then
+            # An .mgl mounts its file after its delay (1 s in ours), so right
+            # after the core loads /tmp/FULLPATH still names the previous
+            # session's game. Wait for one written since the core loaded; if
+            # none comes (the core loaded without an .mgl), take what is there.
+            game=""
+            n=0
+            while [ $n -lt 8 ]; do
+                [ /tmp/FULLPATH -nt /tmp/CORENAME ] && game=$(resolve_game) && break
+                sleep 0.5; n=$((n + 1))
+            done
+            [ -z "$game" ] && game=$(resolve_game)
+        else
+            game=$(resolve_game)
         fi
         # Main rewrites /tmp/FULLPATH with the directory being browsed whenever
         # the OSD file browser is open; that is not a new game. While the core

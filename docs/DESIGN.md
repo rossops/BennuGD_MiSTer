@@ -809,3 +809,25 @@ That is the next target (direct-threaded dispatch).
   `build.sh` now applies the whole stack to a scratch index first
   (`GIT_INDEX_FILE`, `apply --cached`) and skips the loop when that
   matches the working tree.
+
+## 2026-10-04: the wrong game for two seconds (daemon)
+
+Found during a fresh update_all install: launching a game from the menu
+core first started the previous session's game, then restarted on the
+chosen one two seconds later. Main writes /tmp/CORENAME when the core
+loads, but the .mgl mounts its file after its delay (`delay="1"`), so
+/tmp/FULLPATH is rewritten about a second later. The daemon only waited
+when the path was empty, and a stale path is not empty. On a core change
+it now waits up to 4 s for a FULLPATH newer than CORENAME (`-nt`; /bin/sh
+is bash on MiSTer Linux and compares to the nanosecond), and falls back
+to whatever is there when none comes, which is the old behaviour for a
+core loaded from its .rbf. Tested on the device: menu -> 5.2 and
+menu -> 5.1 start the right game once, 5.1 -> 5.2 with the core loaded
+restarts once, the .rbf alone still starts the last game.
+
+The same session also confirmed the update_all path end to end: with the
+install removed, the README's downloader.ini entry plus update_all put
+all ten files on the card byte-identical to main, and Scripts ->
+BennuGD_install finished the setup. Over ssh, never run install.sh (or
+anything that kills by `ps | grep bennugd-launcherd`) from a command line
+that itself contains that string: the loop kills the ssh shell.
