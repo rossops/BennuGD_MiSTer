@@ -1,0 +1,83 @@
+diff --git a/modules/libblit/g_blit.c b/modules/libblit/g_blit.c
+--- a/modules/libblit/g_blit.c
++++ b/modules/libblit/g_blit.c
+@@ -110,6 +110,27 @@
+     uint32_t g   = (((( t >> 5 ) & 0x3F ) * ghost_f1 ) >> 8 ) + (((( d >> 5 ) & 0x3F ) * ghost_f2 ) >> 8 ) ;
+     return ( uint16_t )((( rb >> 5 ) & 0xF800 ) | ( g << 5 ) | ( rb & 0x1F )) ;
+ }
++
++#ifdef __ARM_NEON
++#include <arm_neon.h>
++
++/* ghost_blend16 on 8 pixels at once. A field times a factor <= 256 fits in
++   16 bits (63 * 256), so per-lane u16 arithmetic gives the same result bit
++   for bit, overflowing sums included; lanes whose texel is 0 (the colour
++   key) keep d. */
++static inline uint16x8_t ghost_blend16x8( uint16x8_t t, uint16x8_t d, uint16x8_t f1, uint16x8_t f2 )
++{
++    uint16x8_t m5 = vdupq_n_u16( 0x1F ), m6 = vdupq_n_u16( 0x3F ) ;
++    uint16x8_t r = vaddq_u16( vshrq_n_u16( vmulq_u16( vshrq_n_u16( t, 11 ), f1 ), 8 ),
++                              vshrq_n_u16( vmulq_u16( vshrq_n_u16( d, 11 ), f2 ), 8 ) ) ;
++    uint16x8_t g = vaddq_u16( vshrq_n_u16( vmulq_u16( vandq_u16( vshrq_n_u16( t, 5 ), m6 ), f1 ), 8 ),
++                              vshrq_n_u16( vmulq_u16( vandq_u16( vshrq_n_u16( d, 5 ), m6 ), f2 ), 8 ) ) ;
++    uint16x8_t b = vaddq_u16( vshrq_n_u16( vmulq_u16( vandq_u16( t, m5 ), f1 ), 8 ),
++                              vshrq_n_u16( vmulq_u16( vandq_u16( d, m5 ), f2 ), 8 ) ) ;
++    uint16x8_t o = vorrq_u16( vorrq_u16( vshlq_n_u16( vandq_u16( r, m5 ), 11 ), vshlq_n_u16( g, 5 ) ), vandq_u16( b, m5 ) ) ;
++    return vbslq_u16( vceqq_u16( t, vdupq_n_u16( 0 ) ), d, o ) ;
++}
++#endif
+ uint8_t   * ghost8;
+ 
+ uint32_t * pcolorequiv = NULL ;
+@@ -640,6 +661,25 @@
+ 
+     if ( ghost_arith )
+     {
++#ifdef __ARM_NEON
++        if ( !inct && orig != dest )
++        {
++            /* scaled but not rotated: one source row for the whole span */
++            uint16_t * row = ( uint16_t * ) orig->data + ( orig->pitch * ( ct >> 16 ) >> 1 );
++            uint16x8_t f1 = vdupq_n_u16( ghost_f1 ), f2 = vdupq_n_u16( ghost_f2 );
++            uint16_t tt[8];
++            int k;
++
++            for ( ; pixels >= 8; pixels -= 8, ptr += 8 )
++            {
++                for ( k = 0; k < 8; k++, cs += incs ) tt[k] = row[cs >> 16];
++                vst1q_u16( ptr, ghost_blend16x8( vld1q_u16( tt ), vld1q_u16( ptr ), f1, f2 ) );
++            }
++            for ( ; pixels--; ptr++, cs += incs )
++                if ( row[cs >> 16] ) *ptr = ghost_blend16( row[cs >> 16], *ptr );
++            return;
++        }
++#endif
+         while ( pixels-- )
+         {
+             tex = ( uint16_t * ) orig->data + ( orig->pitch * ( ct >> 16 ) >> 1 ) + ( cs >> 16 );
+@@ -1307,6 +1347,25 @@
+ 
+     if ( ghost_arith )
+     {
++#ifdef __ARM_NEON
++        /* left to right: 8 at a time where source and target rows do not overlap */
++        if ( incs == 1 )
++        {
++            uint16x8_t f1 = vdupq_n_u16( ghost_f1 ), f2 = vdupq_n_u16( ghost_f2 );
++
++            while ( l-- )
++            {
++                i = pixels;
++                if ( tex + pixels <= scr || scr + pixels <= tex )
++                    for ( ; i >= 8; i -= 8, scr += 8, tex += 8 )
++                        vst1q_u16( scr, ghost_blend16x8( vld1q_u16( tex ), vld1q_u16( scr ), f1, f2 ) );
++                for ( ; i--; scr++, tex++ )
++                    if ( *tex ) *scr = ghost_blend16( *tex, *scr );
++                scr = ( uint16_t * )( _scr += scr_inc ); tex = ( uint16_t * )( _tex += tex_inc );
++            }
++            return;
++        }
++#endif
+         while ( l-- )
+         {
+             for ( i = pixels; i--; )

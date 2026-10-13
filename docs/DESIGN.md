@@ -853,3 +853,44 @@ of the reporter's add-ons, so this shows the mechanism, not a speed-up.
 Two limits: after the core exits, a process pinned to CPU 1 by a user
 gets widened. A process started during the game inherits CPU 1 and keeps
 it until it exits.
+
+## 2026-10-12: NEON translucent spans (patch 0008)
+
+The first prof= capture of real play (SorR 5.2, about 2 minutes, 440 of
+7332 frames over budget) put blitting ahead of the interpreter in slow
+frames. Blitting was ~45 % in total and `instance_go` 19 %.
+`draw_span_16to16_translucent` alone was 24.6 % and
+`draw_hspan_16to16_translucent` 5.9 %. Vorbis decode plus audio
+conversion was ~2 %, so a decode thread is not worth it. ~12 % landed in
+shared libraries and stays unnamed: the dump does not record the maps.
+A throwaway counter over the attract sequence showed what those blits
+are:
+
+- 94 % of translucent pixels use one factor pair, 68/188: 666 M scaled
+  span pixels and 255 M hspan pixels in 9600 frames. 128/128 and
+  132/124 make up the rest.
+- No span was rotated (`inct == 0` every time), and every hspan ran
+  left to right (`incs == 1`).
+
+0008 adds `ghost_blend16x8`, the arithmetic blend of 0005 on eight
+pixels in NEON u16 lanes. A field times a factor <= 256 fits in 16 bits
+(63 * 256), and `gr_alpha16_factor` never exceeds 256, so the result is
+bit-identical, overflowing sums included. Texels of 0 keep the target
+pixel (`vbsl`). The span fast path (`!inct`, source graph != target)
+takes the source row once and gathers 8 texels at a time. The hspan fast
+path (`incs == 1`) loads 8 at a time on rows where source and target do
+not overlap. Everything else keeps the scalar code, as do non-NEON
+builds.
+
+- **Exactness.** A device test built from the function text, against
+  the pre-0008 functions: every factor pair 0-256 x 0-256 on random
+  pixels (34 M lanes), every texel for the game's pairs (25 M lanes),
+  and 200 k random span plus 200 k hspan calls (lengths 0-69, tails,
+  scale steps -1..2, 1 in 8 colour key). 0 mismatches. A mutant with
+  the colour-key select swapped fails 177 k of 200 k cases.
+- **Numbers.** Headless attract A-B-A (`audio=none`, frames 1200-9600,
+  stats windows averaged): run p50 13.41 / 9.19 / 13.41 ms (-31 %),
+  p99 26.95 / 22.11 / 26.51 ms, max 36.0 / 26.8 / 37.8 ms. The heavy
+  stretch (6600-9600) is the same: 13.4 -> 9.2 ms. The user played it
+  on the device and confirmed it plays well. The worst 1 % of frames
+  (~22 ms) are still over budget.
