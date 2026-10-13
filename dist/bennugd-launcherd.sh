@@ -39,6 +39,23 @@ stop_game() {
     sync    # the game's save files: do not leave them in the card's write cache
 }
 
+# The game thread runs on CPU 0. Other user processes (Zaparoo, the remote,
+# bgm's mpg123, OLED scripts, ...) can wake up there and take its time, so
+# while the core runs they go to CPU 1 and come back after. Kernel threads,
+# Main (which pins itself to CPU 1), the frontend and this daemon stay put.
+#   move_others <from cpu list> <to mask>: every thread allowed on exactly <from>
+move_others() {
+    skip=" $$ $pid $(pidof MiSTer bennugd 2>/dev/null) "
+    for d in /proc/[0-9]*; do
+        case "$skip" in *" ${d#/proc/} "*) continue ;; esac
+        [ -e "$d/exe" ] || continue   # kernel thread (or gone)
+        for t in "$d"/task/[0-9]*; do
+            [ "$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' "$t/status" 2>/dev/null)" = "$1" ] &&
+                taskset -p "$2" "${t##*/}" >/dev/null 2>&1
+        done
+    done
+}
+
 # only one of us: an older instance would keep launching its own frontend
 for p in $(ps | grep "[b]ennugd-launcherd" | awk '{print $1}'); do [ "$p" != "$$" ] && kill "$p" 2>/dev/null; done
 log "daemon start (pid $$)"
@@ -108,9 +125,11 @@ while :; do
             # Main busy-polls the FPGA on one core the whole time our core is
             # loaded; the game needs that core more than Main's polling does
             for m in $(pidof MiSTer); do renice 10 "$m" >/dev/null 2>&1; done
+            move_others 0-1 2
             log "core $core: started pid $pid game=${game:-<cfg default>}"
         else
             for m in $(pidof MiSTer); do renice 0 "$m" >/dev/null 2>&1; done
+            move_others 1 3
             log "core $core: frontend stopped"
         fi
         last_core=$core

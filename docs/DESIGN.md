@@ -831,3 +831,25 @@ all ten files on the card byte-identical to main, and Scripts ->
 BennuGD_install finished the setup. Over ssh, never run install.sh (or
 anything that kills by `ps | grep bennugd-launcherd`) from a command line
 that itself contains that string: the loop kills the ssh shell.
+
+## 2026-10-12: other processes off the game's CPU (daemon)
+
+A user's A/B report (htop, add-ons stopped with SIGSTOP) showed that
+Zaparoo, the web remote, bgm's mpg123 and OLED scripts compete with the
+game. Main sits on CPU 1 by its own choice and the game thread on CPU 0,
+but everything else could run on either, so it could take time from the
+game thread. While the core runs, the daemon now moves every user-space
+thread allowed on both CPUs to CPU 1 (`move_others 0-1 2`, util-linux
+`taskset -p` per thread). When the core goes, it moves everything on CPU 1
+back to both (`move_others 1 3`). Nothing gets stopped, so Zaparoo and the
+remote keep working mid-game. Skipped: kernel threads (no `exe`), Main,
+the frontend and the daemon itself, so the frontend keeps its game/copier
+split.
+Tested on our board: during the game all ~25 user processes sat on CPU 1.
+Back on the menu they were on 0-1 again, and Main kept its CPU 1 pin.
+Main's second thread is pinned to CPU 0 but used no time in 10 s of
+gameplay, and its polling thread took 96 % of CPU 1. Our board runs none
+of the reporter's add-ons, so this shows the mechanism, not a speed-up.
+Two limits: after the core exits, a process pinned to CPU 1 by a user
+gets widened. A process started during the game inherits CPU 1 and keeps
+it until it exits.
