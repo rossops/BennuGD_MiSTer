@@ -7,13 +7,15 @@ and controller plumbing; the DE10-Nano's ARM side runs the BennuGD
 interpreter that the game was written for. It is one core, and any BennuGD
 1.x game can ride on it, but SorR is the one that has been tested.
 
-**Status: alpha.** It is generally playable: correct colours, vsynced
-video without tearing, pads mapped in the MiSTer OSD, steady sound through
-level transitions, saves working. Much remains to be tested. The heaviest
-scenes still run below 60 fps because the interpreter is out of CPU there,
-only one pad has been tried, only HDMI output has been checked, and other
-BennuGD games have not been tried at all. Version 5.1 of SorR has its own
-menu entry and plays, picture and sound as good as 5.2's; it has had a
+**Status: beta.** It plays well. Colours are right, video is vsynced
+with no tearing, pads map through the MiSTer OSD, sound holds steady
+through level transitions and saves work. The October speed work took
+most of the slowdown out of the busy stages, and testers say it plays
+great now. A really crowded scene can still drop the odd frame on the
+stock 800 MHz CPU. Some things are still untested: only one pad has
+been tried, only HDMI output has been checked, and other BennuGD games
+have not been tried at all. Version 5.1 of SorR has its own menu entry
+and plays, picture and sound as good as 5.2's; it has had a
 quarter of an hour of play so far, not a playthrough. Expect rough edges and please
 report what you find.
 
@@ -98,7 +100,7 @@ save. A save made with
 tested is the second row of the table above (MD5
 `2e10aec879bdb9c398ffdab9e44433be`).
 
-**3. Unpack the release.** Download `BennuGD_MiSTer_alpha_<date>.zip (the newest one)` from
+**3. Unpack the release.** Download `BennuGD_MiSTer_beta-<date>.zip` (the newest one) from
 the Releases page and unzip it onto the root of the SD card. It creates:
 
 ```
