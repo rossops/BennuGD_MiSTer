@@ -131,9 +131,21 @@ static void read_cfg(const char *path)
  * runs slower than real time: see audio_topup. */
 static retro_audio_callback_t core_mix;
 
+/* The core's only clock: SDL_GetTicks, and with it the game's timer[] and
+ * get_timer(), reads this. Without it every game timer stands still. */
+static retro_time_t time_usec(void)
+{
+    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (retro_time_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
 static bool env_cb(unsigned cmd, void *data)
 {
     switch (cmd) {
+    case RETRO_ENVIRONMENT_GET_PERF_INTERFACE:
+        memset(data, 0, sizeof(struct retro_perf_callback));
+        ((struct retro_perf_callback *)data)->get_time_usec = time_usec;
+        return true;
     case RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: {
         enum retro_pixel_format f = *(enum retro_pixel_format *)data;
         if (f != RETRO_PIXEL_FORMAT_RGB565) { host_log("env: pixel format %d refused", f); return false; }
