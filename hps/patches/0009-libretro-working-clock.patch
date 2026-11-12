@@ -1,0 +1,31 @@
+diff --git a/libretro/libretro.c b/libretro/libretro.c
+index 337073d..67dc052 100644
+--- a/libretro/libretro.c
++++ b/libretro/libretro.c
+@@ -1005,7 +1005,10 @@ void retro_run(void)
+             }
+         }
+ 
+-        if (fps_value != last_av_info.timing.fps || force_frame_limiter)
++        /* A rate above the frontend's refresh (see the cap above) is paced
++         * by the frontend alone: the limiter would see 60 of the 120 frames
++         * it was promised and start skipping. */
++        if ((fps_value != last_av_info.timing.fps && !(libretro_refresh_rate > 0 && fps_value > libretro_refresh_rate)) || force_frame_limiter)
+         {
+             retro_enable_frame_limiter = true;
+         }
+diff --git a/libretro/sdl-libretro/src/timer/libretro/SDL_systimer.c b/libretro/sdl-libretro/src/timer/libretro/SDL_systimer.c
+index 9aec029..1406882 100644
+--- a/libretro/sdl-libretro/src/timer/libretro/SDL_systimer.c
++++ b/libretro/sdl-libretro/src/timer/libretro/SDL_systimer.c
+@@ -49,7 +49,9 @@ void SDL_StartTicks(void)
+ 
+ Uint32 SDL_GetTicks (void)
+ {
+-	return (Uint32)(retro_get_microseconds() - start)/1000;
++	/* Divide before narrowing: the cast used to cut the microseconds to 32
++	 * bits first, so the ticks jumped back to 0 every 71.6 minutes. */
++	return (Uint32)((retro_get_microseconds() - start)/1000);
+ }
+ 
+ void SDL_Delay (Uint32 ms)
